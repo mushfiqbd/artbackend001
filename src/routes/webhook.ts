@@ -210,7 +210,11 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
     // 3. Resolve flexible fields
     const eventType = resolveEventType(payload);
     const symbol = resolveSymbol(payload);
-    const eventId = payload.event_id || `${Date.now()}_${symbol}_${eventType}`;
+    
+    // Make event_id unique per user to allow multiple users with same TradingView alert
+    const baseEventId = payload.event_id || `${Date.now()}_${symbol}_${eventType}`;
+    const eventId = `${baseEventId}_user_${userId.substring(0, 8)}`; // Add user prefix for uniqueness
+    
     const strategyId = payload.strategy_id || "manual";
 
     if (!symbol) {
@@ -221,7 +225,7 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
       });
     }
 
-    // 4. Idempotency check
+    // 4. Idempotency check - now user-specific even with same TradingView event_id
     const { data: existing } = await supabase
       .from("webhook_events")
       .select("id")
@@ -231,6 +235,7 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
       .single();
 
     if (existing) {
+      console.log(`ℹ️ Duplicate event detected for user ${userId.substring(0, 8)}: ${eventId}`);
       return res.status(200).json({
         success: true,
         status: "duplicate",
@@ -238,16 +243,20 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
       });
     }
 
-    // 5. Log webhook event
+    // 5. Log webhook event (store both original and unique event_id)
     await supabase.from("webhook_events").insert({
       user_id: userId,
-      event_id: eventId,
+      event_id: eventId, // Unique per user
       event_type: eventType,
       strategy_id: strategyId,
       symbol,
       exchange: exchangeName,
       status: "received",
-      payload: req.body,
+      payload: {
+        ...req.body,
+        original_event_id: baseEventId, // Store original for reference
+        user_suffix: userId.substring(0, 8),
+      },
     });
 
     // 6. Get exchange client(s)
