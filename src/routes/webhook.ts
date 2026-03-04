@@ -415,12 +415,77 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
           const position = positions.find((p) => p.symbol === symbol);
 
           if (!position) {
-            await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, tpPrice || markPrice, "failed", activeMode, strategyId, "No open position");
-            await updateWebhookStatus(eventId, userId, "failed");
-            return res.status(400).json({
-              success: false,
-              status: "no_position",
-              message: `No open position for ${symbol}`,
+            // No position found - Queue the exit signal for later execution
+            console.log(`⏳ No position for ${symbol}, queueing ${eventType} signal`);
+            
+            // Check if already queued
+            const { data: existingQueue } = await supabase
+              .from("exit_signal_queue")
+              .select("id")
+              .eq("user_id", userId)
+              .eq("event_id", eventId)
+              .single();
+
+            if (existingQueue) {
+              console.log(`ℹ️ Signal already queued: ${eventId}`);
+              await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, tpPrice || markPrice, "queued", activeMode, strategyId, "Already in queue");
+              await updateWebhookStatus(eventId, userId, "processed");
+              
+              return res.json({
+                success: true,
+                status: "queued",
+                message: `Exit signal already queued for ${symbol}. Will execute when position opens.`,
+              });
+            }
+
+            // Add to queue
+            const { error: queueError } = await supabase
+              .from("exit_signal_queue")
+              .insert({
+                user_id: userId,
+                event_id: eventId,
+                event_type: eventType,
+                symbol,
+                exchange: wantsBoth ? "both" : rawExchange,
+                side: eventType.includes("long") || eventType.includes("buy") ? "LONG" : "SHORT",
+                payload: req.body,
+                tp_price: tpPrice,
+                sl_price: null,
+                partial_percent: partialPercent,
+                status: "pending",
+                retry_count: 0,
+                max_retries: 5,
+                created_at: new Date().toISOString(),
+                expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // 24 hours
+              });
+
+            if (queueError) {
+              console.error("Failed to queue exit signal:", queueError.message);
+              await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, tpPrice || markPrice, "failed", activeMode, strategyId, "Failed to queue");
+              await updateWebhookStatus(eventId, userId, "failed");
+              
+              return res.status(500).json({
+                success: false,
+                status: "queue_error",
+                message: "Failed to queue exit signal",
+              });
+            }
+
+            console.log(`✅ Queued ${eventType} for ${symbol} on ${wantsBoth ? "both" : rawExchange}`);
+            await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, tpPrice || markPrice, "queued", activeMode, strategyId, "Queued - no position yet");
+            await updateWebhookStatus(eventId, userId, "processed");
+
+            return res.json({
+              success: true,
+              status: "queued",
+              message: `Exit signal queued for ${symbol}. Will auto-execute when position opens.`,
+              details: { 
+                symbol, 
+                eventType, 
+                tpPrice, 
+                partialPercent,
+                queueUntil: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+              },
             });
           }
 
@@ -542,12 +607,76 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
           const position = positions.find((p) => p.symbol === symbol);
 
           if (!position) {
-            await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, slPrice, "failed", activeMode, strategyId, "No open position");
-            await updateWebhookStatus(eventId, userId, "failed");
-            return res.status(400).json({
-              success: false,
-              status: "no_position",
-              message: `No open position for ${symbol}`,
+            // No position found - Queue the SL signal for later execution
+            console.log(`⏳ No position for ${symbol}, queueing ${eventType} signal`);
+            
+            // Check if already queued
+            const { data: existingQueue } = await supabase
+              .from("exit_signal_queue")
+              .select("id")
+              .eq("user_id", userId)
+              .eq("event_id", eventId)
+              .single();
+
+            if (existingQueue) {
+              console.log(`ℹ️ Signal already queued: ${eventId}`);
+              await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, slPrice, "queued", activeMode, strategyId, "Already in queue");
+              await updateWebhookStatus(eventId, userId, "processed");
+              
+              return res.json({
+                success: true,
+                status: "queued",
+                message: `Stop Loss already queued for ${symbol}. Will execute when position opens.`,
+              });
+            }
+
+            // Add to queue
+            const { error: queueError } = await supabase
+              .from("exit_signal_queue")
+              .insert({
+                user_id: userId,
+                event_id: eventId,
+                event_type: eventType,
+                symbol,
+                exchange: wantsBoth ? "both" : rawExchange,
+                side: eventType.includes("long") || eventType.includes("buy") ? "LONG" : "SHORT",
+                payload: req.body,
+                tp_price: null,
+                sl_price: slPrice,
+                partial_percent: null,
+                status: "pending",
+                retry_count: 0,
+                max_retries: 5,
+                created_at: new Date().toISOString(),
+                expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // 24 hours
+              });
+
+            if (queueError) {
+              console.error("Failed to queue SL signal:", queueError.message);
+              await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, slPrice, "failed", activeMode, strategyId, "Failed to queue");
+              await updateWebhookStatus(eventId, userId, "failed");
+              
+              return res.status(500).json({
+                success: false,
+                status: "queue_error",
+                message: "Failed to queue Stop Loss signal",
+              });
+            }
+
+            console.log(`✅ Queued ${eventType} for ${symbol} on ${wantsBoth ? "both" : rawExchange}`);
+            await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, slPrice, "queued", activeMode, strategyId, "Queued - no position yet");
+            await updateWebhookStatus(eventId, userId, "processed");
+
+            return res.json({
+              success: true,
+              status: "queued",
+              message: `Stop Loss queued for ${symbol}. Will auto-execute when position opens.`,
+              details: { 
+                symbol, 
+                eventType, 
+                slPrice,
+                queueUntil: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+              },
             });
           }
 
@@ -816,6 +945,33 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             console.warn(`⚠️ Leverage set failed for ${setup.exchange} ${symbol}: ${levErr.message}. Continuing with order...`);
           }
 
+          // Get exchange-specific symbol info and adjust quantity
+          let exchangeQty = qty;
+          try {
+            const symInfo = await setup.client.getSymbolInfo(symbol);
+            if (symInfo) {
+              // Round by step size
+              exchangeQty = roundQtyByStep(qty, symInfo.stepSize);
+              
+              // Check minimum quantity
+              if (exchangeQty < symInfo.minQty) {
+                exchangeQty = symInfo.minQty;
+                console.log(`⚠️ ${setup.exchange.toUpperCase()}: Qty adjusted to min ${symInfo.minQty}`);
+              }
+              
+              // Check minimum notional
+              const minNotional = symInfo.minNotional || 5;
+              if (exchangeQty * markPrice < minNotional) {
+                const minQtyByNotional = minNotional / markPrice;
+                exchangeQty = Math.max(exchangeQty, minQtyByNotional);
+                exchangeQty = roundQtyByStep(exchangeQty, symInfo.stepSize);
+                console.log(`⚠️ ${setup.exchange.toUpperCase()}: Qty adjusted for min notional to ${exchangeQty}`);
+              }
+            }
+          } catch (qtyErr: any) {
+            console.warn(`⚠️ ${setup.exchange}: Failed to get symbol info, using base qty: ${qty}`);
+          }
+
           // Place order
           let orderResult: any;
           const isLimitOrder = payload.order_type?.toUpperCase() === "LIMIT";
@@ -824,7 +980,7 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             orderResult = await setup.client.placeOrder({
               symbol,
               side,
-              quantity: qty,
+              quantity: exchangeQty,
               type: isLimitOrder ? "LIMIT" : "MARKET",
               price: isLimitOrder && payload.price ? parseFloat(String(payload.price)) : undefined,
             });
@@ -832,7 +988,7 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             orderResult = await setup.client.placeOrder({
               symbol,
               side: side === "BUY" ? "Buy" : "Sell",
-              quantity: qty,
+              quantity: exchangeQty,
               type: isLimitOrder ? "Limit" : "Market",
               // Only include price for LIMIT orders
               price: isLimitOrder && payload.price ? parseFloat(String(payload.price)) : undefined,
@@ -845,7 +1001,7 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             setup.exchange,
             symbol,
             eventType,
-            qty,
+            exchangeQty,
             orderResult?.price || markPrice,
             "filled",
             activeMode,
