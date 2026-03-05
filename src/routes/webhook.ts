@@ -372,7 +372,96 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
 
     // 8. Handle CLOSE events (exit, close_all, exit_long, exit_short)
     if (eventType === "exit" || eventType === "close_all" || eventType.startsWith("exit_")) {
+      // First check if we have API keys
       if (allExchangeSetups.length > 0) {
+        // Check if position exists on any exchange before attempting close
+        let positionExists = false;
+        for (const setup of allExchangeSetups) {
+          try {
+            const positions = await setup.client.getPositions();
+            if (positions.some((p) => p.symbol === symbol)) {
+              positionExists = true;
+              break;
+            }
+          } catch (err: any) {
+            console.warn(`Failed to check positions on ${setup.exchange}: ${err.message}`);
+          }
+        }
+
+        if (!positionExists) {
+          // No position found - queue the exit signal
+          console.log(`⏳ No position for ${symbol}, queueing ${eventType} signal`);
+          
+          // Check if already queued
+          const { data: existingQueue } = await supabase
+            .from("exit_signal_queue")
+            .select("id")
+            .eq("user_id", userId)
+            .eq("event_id", eventId)
+            .single();
+
+          if (existingQueue) {
+            console.log(`ℹ️ Signal already queued: ${eventId}`);
+            await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, markPrice, "queued", activeMode, strategyId, "Already queued - waiting for position");
+            await updateWebhookStatus(eventId, userId, "processed");
+            
+            return res.json({
+              success: true,
+              status: "queued",
+              message: `Exit signal already queued for ${symbol}. Will execute when position opens.`,
+            });
+          }
+
+          // Add to queue
+          const { error: queueError } = await supabase
+            .from("exit_signal_queue")
+            .insert({
+              user_id: userId,
+              event_id: eventId,
+              event_type: eventType,
+              symbol,
+              exchange: wantsBoth ? "both" : rawExchange,
+              side: eventType.includes("long") || eventType.includes("buy") ? "LONG" : "SHORT",
+              payload: req.body,
+              tp_price: extractTPPrice(req.body),
+              sl_price: extractSLPrice(req.body),
+              partial_percent: extractPartialPercentage(req.body),
+              status: "pending",
+              retry_count: 0,
+              max_retries: 10,
+              created_at: new Date().toISOString(),
+              expires_at: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
+            });
+
+          if (queueError) {
+            console.error("Failed to queue exit signal:", queueError.message);
+            await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, markPrice, "failed", activeMode, strategyId, "Failed to queue");
+            await updateWebhookStatus(eventId, userId, "failed");
+            
+            return res.status(500).json({
+              success: false,
+              status: "queue_error",
+              message: "Failed to queue exit signal",
+            });
+          }
+
+          console.log(`✅ Queued ${eventType} for ${symbol} on ${wantsBoth ? "both" : rawExchange}`);
+          await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, markPrice, "queued", activeMode, strategyId, "Queued - no position found");
+          await updateWebhookStatus(eventId, userId, "processed");
+
+          return res.json({
+            success: true,
+            status: "queued",
+            message: `Exit signal queued for ${symbol}. Will auto-execute when position opens.`,
+            details: { 
+              symbol, 
+              eventType, 
+              queueUntil: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
+            },
+          });
+        }
+
+        // Position exists - proceed with close
         const errors: string[] = [];
 
         for (const setup of allExchangeSetups) {
