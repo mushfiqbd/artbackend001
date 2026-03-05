@@ -186,14 +186,13 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
     // 1. Validate basic structure
     const payload = webhookSchema.parse(req.body);
 
-    // 2. Auth via passphrase
-    const { data: settings } = await supabase
+    // 2. Auth via passphrase — Support MULTIPLE users with same secret!
+    const { data: allSettings } = await supabase
       .from("app_settings")
       .select("webhook_secret, user_id, mode, default_exchange")
-      .limit(1)
-      .single();
+      .eq("webhook_secret", payload.passphrase);
 
-    if (!settings || payload.passphrase !== settings.webhook_secret) {
+    if (!allSettings || allSettings.length === 0) {
       return res.status(401).json({
         success: false,
         status: "unauthorized",
@@ -201,11 +200,18 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
       });
     }
 
-    const userId = settings.user_id;
-    const activeMode = payload.mode || settings.mode || "demo";
-    const rawExchange = (payload.exchange || settings.default_exchange || "binance").toLowerCase();
-    const wantsBoth = rawExchange === "both";
-    const exchangeName = rawExchange; // Store the actual exchange value ("both", "binance", or "bybit")
+    console.log(`🔑 Webhook authenticated for ${allSettings.length} user(s) with this secret`);
+
+    // Process webhook for EACH user with this secret
+    const userResults = [];
+    
+    for (const settings of allSettings) {
+      try {
+        const userId = settings.user_id;
+        const activeMode = payload.mode || settings.mode || "demo";
+        const rawExchange = (payload.exchange || settings.default_exchange || "binance").toLowerCase();
+        const wantsBoth = rawExchange === "both";
+        const exchangeName = rawExchange; // Store the actual exchange value ("both", "binance", or "bybit")
 
     // 3. Resolve flexible fields
     const eventType = resolveEventType(payload);
@@ -218,11 +224,13 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
     const strategyId = payload.strategy_id || "manual";
 
     if (!symbol) {
-      return res.status(400).json({
+      userResults.push({
+        userId: userId.substring(0, 8),
         success: false,
         status: "missing_symbol",
-        message: "No symbol/ticker/pair found in payload",
+        message: "No symbol/ticker/pair found in payload"
       });
+      continue; // Skip to next user
     }
 
     // 4. Idempotency check - now user-specific even with same TradingView event_id
@@ -236,11 +244,13 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
 
     if (existing) {
       console.log(`ℹ️ Duplicate event detected for user ${userId.substring(0, 8)}: ${eventId}`);
-      return res.status(200).json({
+      userResults.push({
+        userId: userId.substring(0, 8),
         success: true,
         status: "duplicate",
-        message: "Event already processed — skipped",
+        message: "Event already processed — skipped"
       });
+      continue; // Skip to next user
     }
 
     // 5. Log webhook event (store both original and unique event_id)
@@ -275,28 +285,75 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
 
     if ((!exchangeSetup && !wantsBoth) || (wantsBoth && allExchangeSetups.length === 0)) {
       if (activeMode === "real") {
-        await logTrade(
-          userId,
-          eventId,
-          exchangeName,
-          symbol,
-          eventType,
-          0,
-          0,
-          "failed",
-          activeMode,
-          strategyId,
-          wantsBoth
-            ? "No API keys configured for any exchange"
-            : `No API keys configured for ${exchangeName}`
-        );
-        await updateWebhookStatus(eventId, userId, "failed");
-        return res.status(400).json({
-          success: false,
-          status: "no_api_keys",
-          message: wantsBoth
-            ? "No API keys configured for Binance or Bybit. Add them in Settings."
-            : `No API keys configured for ${exchangeName}. Add them in Settings.`,
+        // Queue the signal for later execution when API keys are configured
+        console.log(`⏳ No API keys configured, queueing ${eventType} signal`);
+        
+        // Check if already queued
+        const { data: existingQueue } = await supabase
+          .from("exit_signal_queue")
+          .select("id")
+          .eq("user_id", userId)
+          .eq("event_id", eventId)
+          .single();
+
+        if (existingQueue) {
+          console.log(`ℹ️ Signal already queued: ${eventId}`);
+          await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, 0, "queued", activeMode, strategyId, "Already queued - waiting for API keys");
+          await updateWebhookStatus(eventId, userId, "processed");
+          
+          return res.json({
+            success: true,
+            status: "queued",
+            message: `Signal queued for ${symbol}. Will execute when API keys are configured in Settings.`,
+          });
+        }
+
+        // Add to queue
+        const { error: queueError } = await supabase
+          .from("exit_signal_queue")
+          .insert({
+            user_id: userId,
+            event_id: eventId,
+            event_type: eventType,
+            symbol,
+            exchange: wantsBoth ? "both" : rawExchange,
+            side: eventType.includes("long") || eventType.includes("buy") ? "LONG" : "SHORT",
+            payload: req.body,
+            tp_price: extractTPPrice(req.body),
+            sl_price: extractSLPrice(req.body),
+            partial_percent: extractPartialPercentage(req.body),
+            status: "pending",
+            retry_count: 0,
+            max_retries: 10, // More retries for API key wait
+            created_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(), // 48 hours for API key setup
+          });
+
+        if (queueError) {
+          console.error("Failed to queue signal:", queueError.message);
+          await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, 0, "failed", activeMode, strategyId, "Failed to queue");
+          await updateWebhookStatus(eventId, userId, "failed");
+          
+          return res.status(500).json({
+            success: false,
+            status: "queue_error",
+            message: "Failed to queue signal",
+          });
+        }
+
+        console.log(`✅ Queued ${eventType} for ${symbol} on ${wantsBoth ? "both" : rawExchange}`);
+        await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, 0, "queued", activeMode, strategyId, "Queued - waiting for API keys");
+        await updateWebhookStatus(eventId, userId, "processed");
+
+        return res.json({
+          success: true,
+          status: "queued",
+          message: `Signal queued for ${symbol}. Configure API keys in Settings to auto-execute.`,
+          details: { 
+            symbol, 
+            eventType, 
+            queueUntil: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
+          },
         });
       }
     }
@@ -507,24 +564,77 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             .single();
 
           if (positionRecord?.state === "PENDING_ENTRY") {
-            await logTrade(
-              userId,
-              eventId,
-              exchangeName,
-              symbol,
-              eventType,
-              0,
-              tpPrice || markPrice,
-              "failed",
-              activeMode,
-              strategyId,
-              "Position still in PENDING_ENTRY state - TP/SL updates blocked until order fills"
-            );
-            await updateWebhookStatus(eventId, userId, "failed");
-            return res.status(400).json({
-              success: false,
-              status: "pending_entry",
-              message: `Cannot update TP/SL: Position for ${symbol} is still in PENDING_ENTRY state. Wait for order to fill before updating take profit or stop loss.`,
+            // Queue the TP/SL signal for later execution when position fills
+            console.log(`⏳ Position in PENDING_ENTRY, queueing ${eventType} signal`);
+            
+            // Check if already queued
+            const { data: existingQueue } = await supabase
+              .from("exit_signal_queue")
+              .select("id")
+              .eq("user_id", userId)
+              .eq("event_id", eventId)
+              .single();
+
+            if (existingQueue) {
+              console.log(`ℹ️ Signal already queued: ${eventId}`);
+              await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, tpPrice || markPrice, "queued", activeMode, strategyId, "Already queued - waiting for position to fill");
+              await updateWebhookStatus(eventId, userId, "processed");
+              
+              return res.json({
+                success: true,
+                status: "queued",
+                message: `TP/SL signal queued for ${symbol}. Will execute when position fills from PENDING_ENTRY state.`,
+              });
+            }
+
+            // Add to queue
+            const { error: queueError } = await supabase
+              .from("exit_signal_queue")
+              .insert({
+                user_id: userId,
+                event_id: eventId,
+                event_type: eventType,
+                symbol,
+                exchange: wantsBoth ? "both" : rawExchange,
+                side: eventType.includes("long") || eventType.includes("buy") ? "LONG" : "SHORT",
+                payload: req.body,
+                tp_price: tpPrice,
+                sl_price: null,
+                partial_percent: partialPercent,
+                status: "pending",
+                retry_count: 0,
+                max_retries: 5,
+                created_at: new Date().toISOString(),
+                expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // 24 hours
+              });
+
+            if (queueError) {
+              console.error("Failed to queue TP/SL signal:", queueError.message);
+              await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, tpPrice || markPrice, "failed", activeMode, strategyId, "Failed to queue");
+              await updateWebhookStatus(eventId, userId, "failed");
+              
+              return res.status(500).json({
+                success: false,
+                status: "queue_error",
+                message: "Failed to queue TP/SL signal",
+              });
+            }
+
+            console.log(`✅ Queued ${eventType} for ${symbol} on ${wantsBoth ? "both" : rawExchange}`);
+            await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, tpPrice || markPrice, "queued", activeMode, strategyId, "Queued - waiting for position to fill from PENDING_ENTRY");
+            await updateWebhookStatus(eventId, userId, "processed");
+
+            return res.json({
+              success: true,
+              status: "queued",
+              message: `TP/SL signal queued for ${symbol}. Will auto-execute when position fills.`,
+              details: { 
+                symbol, 
+                eventType, 
+                tpPrice,
+                partialPercent,
+                queueUntil: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+              },
             });
           }
 
@@ -698,24 +808,76 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             .single();
 
           if (positionRecord?.state === "PENDING_ENTRY") {
-            await logTrade(
-              userId,
-              eventId,
-              exchangeName,
-              symbol,
-              eventType,
-              0,
-              slPrice,
-              "failed",
-              activeMode,
-              strategyId,
-              "Position still in PENDING_ENTRY state - SL updates blocked until order fills"
-            );
-            await updateWebhookStatus(eventId, userId, "failed");
-            return res.status(400).json({
-              success: false,
-              status: "pending_entry",
-              message: `Cannot update Stop Loss: Position for ${symbol} is still in PENDING_ENTRY state. Wait for order to fill before updating stop loss.`,
+            // Queue the SL signal for later execution when position fills
+            console.log(`⏳ Position in PENDING_ENTRY, queueing ${eventType} signal`);
+            
+            // Check if already queued
+            const { data: existingQueue } = await supabase
+              .from("exit_signal_queue")
+              .select("id")
+              .eq("user_id", userId)
+              .eq("event_id", eventId)
+              .single();
+
+            if (existingQueue) {
+              console.log(`ℹ️ Signal already queued: ${eventId}`);
+              await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, slPrice, "queued", activeMode, strategyId, "Already queued - waiting for position to fill");
+              await updateWebhookStatus(eventId, userId, "processed");
+              
+              return res.json({
+                success: true,
+                status: "queued",
+                message: `Stop Loss queued for ${symbol}. Will execute when position fills from PENDING_ENTRY state.`,
+              });
+            }
+
+            // Add to queue
+            const { error: queueError } = await supabase
+              .from("exit_signal_queue")
+              .insert({
+                user_id: userId,
+                event_id: eventId,
+                event_type: eventType,
+                symbol,
+                exchange: wantsBoth ? "both" : rawExchange,
+                side: eventType.includes("long") || eventType.includes("buy") ? "LONG" : "SHORT",
+                payload: req.body,
+                tp_price: null,
+                sl_price: slPrice,
+                partial_percent: null,
+                status: "pending",
+                retry_count: 0,
+                max_retries: 5,
+                created_at: new Date().toISOString(),
+                expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), // 24 hours
+              });
+
+            if (queueError) {
+              console.error("Failed to queue SL signal:", queueError.message);
+              await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, slPrice, "failed", activeMode, strategyId, "Failed to queue");
+              await updateWebhookStatus(eventId, userId, "failed");
+              
+              return res.status(500).json({
+                success: false,
+                status: "queue_error",
+                message: "Failed to queue Stop Loss signal",
+              });
+            }
+
+            console.log(`✅ Queued ${eventType} for ${symbol} on ${wantsBoth ? "both" : rawExchange}`);
+            await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, slPrice, "queued", activeMode, strategyId, "Queued - waiting for position to fill from PENDING_ENTRY");
+            await updateWebhookStatus(eventId, userId, "processed");
+
+            return res.json({
+              success: true,
+              status: "queued",
+              message: `Stop Loss queued for ${symbol}. Will auto-execute when position fills.`,
+              details: { 
+                symbol, 
+                eventType, 
+                slPrice,
+                queueUntil: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+              },
             });
           }
 
@@ -981,60 +1143,111 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             console.warn(`⚠️ ${setup.exchange}: Failed to get symbol info, using base qty: ${qty}`);
           }
 
-          // Place order
+          // Place order with error handling per exchange
           let orderResult: any;
           const isLimitOrder = payload.order_type?.toUpperCase() === "LIMIT";
           
-          if (setup.client instanceof BinanceClient) {
-            orderResult = await setup.client.placeOrder({
-              symbol,
-              side,
-              quantity: exchangeQty,
-              type: isLimitOrder ? "LIMIT" : "MARKET",
-              price: isLimitOrder && payload.price ? parseFloat(String(payload.price)) : undefined,
-            });
-          } else if (setup.client instanceof BybitClient) {
-            orderResult = await setup.client.placeOrder({
-              symbol,
-              side: side === "BUY" ? "Buy" : "Sell",
-              quantity: exchangeQty,
-              type: isLimitOrder ? "Limit" : "Market",
-              // Only include price for LIMIT orders
-              price: isLimitOrder && payload.price ? parseFloat(String(payload.price)) : undefined,
-            });
-          }
+          try {
+            console.log(`📤 Placing ${eventType} order on ${setup.exchange.toUpperCase()}...`);
+            
+            if (setup.client instanceof BinanceClient) {
+              orderResult = await setup.client.placeOrder({
+                symbol,
+                side,
+                quantity: exchangeQty,
+                type: isLimitOrder ? "LIMIT" : "MARKET",
+                price: isLimitOrder && payload.price ? parseFloat(String(payload.price)) : undefined,
+              });
+              console.log(`✅ Binance order placed: ${symbol} ${side} qty=${exchangeQty}`);
+            } else if (setup.client instanceof BybitClient) {
+              orderResult = await setup.client.placeOrder({
+                symbol,
+                side: side === "BUY" ? "Buy" : "Sell",
+                quantity: exchangeQty,
+                type: isLimitOrder ? "Limit" : "Market",
+                // Only include price for LIMIT orders
+                price: isLimitOrder && payload.price ? parseFloat(String(payload.price)) : undefined,
+              });
+              console.log(`✅ Bybit order placed: ${symbol} ${side === "BUY" ? "Buy" : "Sell"} qty=${exchangeQty}`);
+            }
 
-          await logTrade(
-            userId,
-            eventId,
-            setup.exchange,
-            symbol,
-            eventType,
-            exchangeQty,
-            orderResult?.price || markPrice,
-            "filled",
-            activeMode,
-            strategyId
-          );
+            await logTrade(
+              userId,
+              eventId,
+              setup.exchange,
+              symbol,
+              eventType,
+              exchangeQty,
+              orderResult?.price || markPrice,
+              "filled",
+              activeMode,
+              strategyId
+            );
+          } catch (orderErr: any) {
+            console.error(`❌ ${setup.exchange.toUpperCase()} order failed: ${orderErr.message}`);
+            errors.push(`${setup.exchange.toUpperCase()}: ${orderErr.message}`);
+            
+            // Log the failure for this specific exchange
+            await logTrade(
+              userId,
+              eventId,
+              setup.exchange,
+              symbol,
+              eventType,
+              exchangeQty,
+              markPrice,
+              "failed",
+              activeMode,
+              strategyId,
+              orderErr.message
+            );
+            
+            // Continue with other exchanges instead of failing all
+            console.log(`⏭️ Continuing with other exchanges...`);
+          }
         }
 
-        if (errors.length === 0) {
-          await updateWebhookStatus(eventId, userId, "executed");
+        // Determine overall status based on errors
+        const successfulExchanges = allExchangeSetups.filter((_, idx) => !errors[idx]);
+        const failedExchanges = allExchangeSetups.filter((_, idx) => errors[idx]);
+
+        if (successfulExchanges.length > 0) {
+          // At least one exchange succeeded - mark as executed (or partially executed)
+          const status = errors.length === 0 ? "executed" : "partially_executed";
+          await updateWebhookStatus(eventId, userId, status);
+
+          const successMsg = wantsBoth 
+            ? `Order executed on ${successfulExchanges.map(s => s.exchange.toUpperCase()).join(", ")}`
+            : `Order executed on ${exchangeName.toUpperCase()}`;
+          
+          const errorMsg = errors.length > 0 
+            ? `. Failed on: ${failedExchanges.map(f => f.exchange.toUpperCase()).join(", ")}. Errors: ${errors.join("; ")}`
+            : "";
 
           return res.json({
             success: true,
-            status: "executed",
-            message: `Order executed on ${wantsBoth ? "all exchanges" : exchangeName}: ${eventType} ${symbol} qty=${qty} lev=${clampedLeverage}x`,
-            details: { symbol, side, qty, leverage: clampedLeverage, eventType, mode: activeMode },
+            status: status,
+            message: `${successMsg}: ${eventType} ${symbol} qty=${qty} lev=${clampedLeverage}x${errorMsg}`,
+            details: { 
+              symbol, 
+              side, 
+              qty, 
+              leverage: clampedLeverage, 
+              eventType, 
+              mode: activeMode,
+              successfulExchanges: successfulExchanges.map(s => s.exchange),
+              failedExchanges: failedExchanges.map(f => ({ exchange: f.exchange, error: errors.find(e => e.includes(f.exchange.toUpperCase())) }))
+            },
+          });
+        } else {
+          // All exchanges failed
+          await updateWebhookStatus(eventId, userId, "failed");
+          return res.status(500).json({
+            success: false,
+            status: "execution_failed",
+            message: `Order failed on all exchanges: ${errors.join(", ")}`,
           });
         }
-
-        await updateWebhookStatus(eventId, userId, "failed");
-        return res.status(500).json({
-          success: false,
-          status: "execution_failed",
-          message: `Order failed on: ${errors.join(", ")}`,
-        });
       } catch (err: any) {
         await logTrade(
           userId,
@@ -1082,17 +1295,41 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
         details: { symbol, side, qty, leverage: clampedLeverage, eventType, mode: activeMode, markPrice },
       });
     }
+    
+    // End of per-user processing logic - continue to next user
   } catch (err: any) {
-    if (err instanceof z.ZodError) {
-      return res.status(400).json({
-        success: false,
-        status: "validation_error",
-        message: err.errors.map((e) => `${e.path.join(".")}: ${e.message}`).join(", "),
-      });
-    }
-    console.error("Webhook error:", err?.message || err);
-    return res.status(500).json({ success: false, status: "error", message: "Webhook processing failed" });
+    // Per-user error handling
+    console.error(`Webhook error for user ${settings?.user_id?.substring(0, 8) || "unknown"}:`, err?.message || err);
+    userResults.push({
+      userId: settings?.user_id?.substring(0, 8) || "unknown",
+      success: false,
+      status: "error",
+      message: err?.message || "Processing failed"
+    });
+    // Continue with next user instead of failing all
   }
+  } // Close the for (const settings of allSettings) loop
+  
+  // All users processed successfully
+  return res.json({
+    success: true,
+    status: "processed",
+    message: `Webhook processed for ${allSettings.length} user(s)`,
+    results: userResults
+  });
+  
+} catch (err: any) {
+  // Outer error handler for validation and system errors
+  if (err instanceof z.ZodError) {
+    return res.status(400).json({
+      success: false,
+      status: "validation_error",
+      message: err.errors.map((e) => `${e.path.join(".")}: ${e.message}`).join(", "),
+    });
+  }
+  console.error("Webhook error:", err?.message || err);
+  return res.status(500).json({ success: false, status: "error", message: "Webhook processing failed" });
+}
 });
 
 // ===== Helper functions =====
