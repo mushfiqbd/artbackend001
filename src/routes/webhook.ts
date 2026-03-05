@@ -208,84 +208,90 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
     for (const settings of allSettings) {
       try {
         const userId = settings.user_id;
+        const userPrefix = `[User: ${userId.substring(0, 8)}]`;
+        
+        console.log(`${userPrefix} 🚀 Starting processing...`);
+        console.log(`${userPrefix} Mode: ${settings.mode}, Exchange: ${settings.default_exchange}`);
+        
         const activeMode = payload.mode || settings.mode || "demo";
         const rawExchange = (payload.exchange || settings.default_exchange || "binance").toLowerCase();
         const wantsBoth = rawExchange === "both";
-        const exchangeName = rawExchange; // Store the actual exchange value ("both", "binance", or "bybit")
+        const exchangeName = rawExchange;
 
-    // 3. Resolve flexible fields
-    const eventType = resolveEventType(payload);
-    const symbol = resolveSymbol(payload);
-    
-    // Make event_id unique per user to allow multiple users with same TradingView alert
-    const baseEventId = payload.event_id || `${Date.now()}_${symbol}_${eventType}`;
-    const eventId = `${baseEventId}_user_${userId.substring(0, 8)}`; // Add user prefix for uniqueness
-    
-    const strategyId = payload.strategy_id || "manual";
+        // 3. Resolve flexible fields
+        const eventType = resolveEventType(payload);
+        const symbol = resolveSymbol(payload);
+        
+        // Make event_id unique per user to allow multiple users with same TradingView alert
+        const baseEventId = payload.event_id || `${Date.now()}_${symbol}_${eventType}`;
+        const eventId = `${baseEventId}_user_${userId.substring(0, 8)}`;
+        
+        const strategyId = payload.strategy_id || "manual";
 
-    if (!symbol) {
-      userResults.push({
-        userId: userId.substring(0, 8),
-        success: false,
-        status: "missing_symbol",
-        message: "No symbol/ticker/pair found in payload"
-      });
-      continue; // Skip to next user
-    }
+        if (!symbol) {
+          console.error(`${userPrefix} ❌ Missing symbol`);
+          userResults.push({
+            userId: userId.substring(0, 8),
+            success: false,
+            status: "missing_symbol",
+            message: "No symbol/ticker/pair found in payload"
+          });
+          continue;
+        }
 
-    // 4. Idempotency check - now user-specific even with same TradingView event_id
-    const { data: existing } = await supabase
-      .from("webhook_events")
-      .select("id")
-      .eq("user_id", userId)
-      .eq("event_id", eventId)
-      .eq("event_type", eventType)
-      .single();
+        // 4. Idempotency check
+        const { data: existing } = await supabase
+          .from("webhook_events")
+          .select("id")
+          .eq("user_id", userId)
+          .eq("event_id", eventId)
+          .eq("event_type", eventType)
+          .single();
 
-    if (existing) {
-      console.log(`ℹ️ Duplicate event detected for user ${userId.substring(0, 8)}: ${eventId}`);
-      userResults.push({
-        userId: userId.substring(0, 8),
-        success: true,
-        status: "duplicate",
-        message: "Event already processed — skipped"
-      });
-      continue; // Skip to next user
-    }
+        if (existing) {
+          console.log(`${userPrefix} ℹ️ Duplicate event detected: ${eventId}`);
+          userResults.push({
+            userId: userId.substring(0, 8),
+            success: true,
+            status: "duplicate",
+            message: "Event already processed"
+          });
+          continue;
+        }
 
-    // 5. Log webhook event (store both original and unique event_id)
-    await supabase.from("webhook_events").insert({
-      user_id: userId,
-      event_id: eventId, // Unique per user
-      event_type: eventType,
-      strategy_id: strategyId,
-      symbol,
-      exchange: exchangeName,
-      status: "received",
-      payload: {
-        ...req.body,
-        original_event_id: baseEventId, // Store original for reference
-        user_suffix: userId.substring(0, 8),
-      },
-    });
+        // 5. Log webhook event (store both original and unique event_id)
+        await supabase.from("webhook_events").insert({
+          user_id: userId,
+          event_id: eventId, // Unique per user
+          event_type: eventType,
+          strategy_id: strategyId,
+          symbol,
+          exchange: exchangeName,
+          status: "received",
+          payload: {
+            ...req.body,
+            original_event_id: baseEventId, // Store original for reference
+            user_suffix: userId.substring(0, 8),
+          },
+        });
 
-    // 6. Get exchange client(s)
-    let exchangeSetup: { client: ExchangeClient; exchange: string } | null = null;
-    let allExchangeSetups: { client: ExchangeClient; exchange: string }[] = [];
+        // 6. Get exchange client(s)
+        let exchangeSetup: { client: ExchangeClient; exchange: string } | null = null;
+        let allExchangeSetups: { client: ExchangeClient; exchange: string }[] = [];
 
-    if (wantsBoth) {
-      allExchangeSetups = await getAllExchangeClients(userId);
-      exchangeSetup = allExchangeSetups.find((c) => c.exchange === "binance") || allExchangeSetups[0] || null;
-    } else {
-      exchangeSetup = await getExchangeClient(userId, exchangeName);
-      if (exchangeSetup) {
-        allExchangeSetups = [exchangeSetup];
-      }
-    }
+        if (wantsBoth) {
+          allExchangeSetups = await getAllExchangeClients(userId);
+          exchangeSetup = allExchangeSetups.find((c) => c.exchange === "binance") || allExchangeSetups[0] || null;
+        } else {
+          exchangeSetup = await getExchangeClient(userId, exchangeName);
+          if (exchangeSetup) {
+            allExchangeSetups = [exchangeSetup];
+          }
+        }
 
-    if ((!exchangeSetup && !wantsBoth) || (wantsBoth && allExchangeSetups.length === 0)) {
-      // No API keys configured - queue the signal regardless of mode
-      console.log(`⏳ No API keys configured, queueing ${eventType} signal`);
+        if ((!exchangeSetup && !wantsBoth) || (wantsBoth && allExchangeSetups.length === 0)) {
+          // No API keys configured - queue the signal regardless of mode
+          console.log(`${userPrefix} ⏳ No API keys configured, queueing ${eventType} signal`);
         
         // Check if already queued
         const { data: existingQueue } = await supabase
@@ -296,15 +302,17 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
           .single();
 
         if (existingQueue) {
-          console.log(`ℹ️ Signal already queued: ${eventId}`);
+          console.log(`${userPrefix} ℹ️ Signal already queued: ${eventId}`);
           await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, 0, "queued", activeMode, strategyId, "Already queued - waiting for API keys");
           await updateWebhookStatus(eventId, userId, "processed");
           
-          return res.json({
+          userResults.push({
+            userId: userId.substring(0, 8),
             success: true,
             status: "queued",
-            message: `Signal queued for ${symbol}. Will execute when API keys are configured in Settings.`,
+            message: `Signal queued for ${symbol}. Will execute when API keys are configured.`
           });
+          continue;
         }
 
         // Add to queue
@@ -323,38 +331,34 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             partial_percent: extractPartialPercentage(req.body),
             status: "pending",
             retry_count: 0,
-            max_retries: 10, // More retries for API key wait
+            max_retries: 10,
             created_at: new Date().toISOString(),
-            expires_at: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(), // 48 hours for API key setup
+            expires_at: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
           });
 
         if (queueError) {
-          console.error("Failed to queue signal:", queueError.message);
-          await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, 0, "failed", activeMode, strategyId, "Failed to queue");
-          await updateWebhookStatus(eventId, userId, "failed");
-          
-          return res.status(500).json({
+          console.error(`${userPrefix} ❌ Failed to queue signal:`, queueError.message);
+          userResults.push({
+            userId: userId.substring(0, 8),
             success: false,
             status: "queue_error",
-            message: "Failed to queue signal",
+            message: queueError.message
           });
+          continue;
         }
 
-        console.log(`✅ Queued ${eventType} for ${symbol} on ${wantsBoth ? "both" : rawExchange}`);
+        console.log(`${userPrefix} ✅ Queued ${eventType} for ${symbol}`);
         await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, 0, "queued", activeMode, strategyId, "Queued - waiting for API keys");
         await updateWebhookStatus(eventId, userId, "processed");
 
-        return res.json({
+        userResults.push({
+          userId: userId.substring(0, 8),
           success: true,
           status: "queued",
-          message: `Signal queued for ${symbol}. Configure API keys in Settings to auto-execute.`,
-          details: { 
-            symbol, 
-            eventType, 
-            queueUntil: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
-          },
+          message: `Signal queued for ${symbol}`
         });
-    }
+        continue;
+      }
 
     // 7. Get mark price for quantity calculation
     let markPrice = 0;
@@ -463,6 +467,21 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
 
         // Position exists - proceed with close
         const errors: string[] = [];
+        
+        // Get the position side for logging
+        let positionSide: string | undefined;
+        for (const setup of allExchangeSetups) {
+          try {
+            const positions = await setup.client.getPositions();
+            const pos = positions.find((p) => p.symbol === symbol);
+            if (pos) {
+              positionSide = pos.side;
+              break;
+            }
+          } catch (err: any) {
+            console.warn(`Failed to get position side on ${setup.exchange}: ${err.message}`);
+          }
+        }
 
         for (const setup of allExchangeSetups) {
           try {
@@ -483,7 +502,9 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
               result?.price || markPrice,
               "filled",
               activeMode,
-              strategyId
+              strategyId,
+              undefined,
+              positionSide
             );
           } catch (err: any) {
             errors.push(`${setup.exchange}: ${err.message}`);
@@ -498,7 +519,8 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
               "failed",
               activeMode,
               strategyId,
-              err.message
+              err.message,
+              positionSide
             );
           }
         }
@@ -772,10 +794,23 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             });
           }
 
-          // Calculate close quantity based on percentage or default to full close
+          // Calculate close quantity based on percentage or default based on TP level
           let closeQty = position.size;
-          if (partialPercent && partialPercent > 0 && partialPercent <= 100) {
-            closeQty = (position.size * partialPercent) / 100;
+          
+          // Default percentages for TP levels if no percentage provided
+          let defaultPercent = null;
+          if (!partialPercent) {
+            if (eventType === "tp1") defaultPercent = 25;   // TP1 = 25% default
+            else if (eventType === "tp2") defaultPercent = 50; // TP2 = 50% default
+            else if (eventType === "tp3") defaultPercent = 75; // TP3 = 75% default
+            else if (eventType === "tp4") defaultPercent = 90; // TP4 = 90% default
+            else if (eventType === "tp5") defaultPercent = 100; // TP5 = 100% default
+          }
+          
+          const effectivePercent = partialPercent || defaultPercent;
+          
+          if (effectivePercent && effectivePercent > 0 && effectivePercent <= 100) {
+            closeQty = (position.size * effectivePercent) / 100;
           }
 
           // Round quantity
@@ -808,7 +843,7 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             });
           }
 
-          await logTrade(userId, eventId, exchangeName, symbol, eventType, closeQty, tpPrice || markPrice, "filled", activeMode, strategyId);
+          await logTrade(userId, eventId, exchangeName, symbol, eventType, closeQty, tpPrice || markPrice, "filled", activeMode, strategyId, undefined, position.side);
           await updateWebhookStatus(eventId, userId, "executed");
 
           return res.json({
@@ -904,7 +939,47 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
 
     // 10. Handle STOP LOSS signals (sl, sl_update)
     if (eventType === "sl" || eventType === "sl_update") {
-      const slPrice = extractSLPrice(payload);
+      let slPrice = extractSLPrice(payload);
+
+      // If no SL price provided, try to get it from the payload's 'price' field or use a default calculation
+      if (!slPrice) {
+        // Try to extract from different possible fields
+        const possiblePrice = payload.price || 
+                             payload.stop_price || 
+                             payload.sl || 
+                             payload.stop_loss ||
+                             payload.new_sl_price;
+        
+        if (possiblePrice) {
+          slPrice = parseFloat(String(possiblePrice));
+          console.log(`${userPrefix} 📊 SL price extracted from alternative field: ${slPrice}`);
+        }
+      }
+
+      // Still no SL price - Check if we can calculate it based on position
+      if (!slPrice && exchangeSetup) {
+        try {
+          const positions = await exchangeSetup.client.getPositions();
+          const position = positions.find((p) => p.symbol === symbol);
+          
+          if (position) {
+            // For LONG positions: SL should be below entry price (e.g., 2% below)
+            // For SHORT positions: SL should be above entry price (e.g., 2% above)
+            const entryPrice = position.entryPrice;
+            const slOffset = 0.02; // 2% default SL offset
+            
+            if (position.side === "LONG") {
+              slPrice = entryPrice * (1 - slOffset);
+            } else {
+              slPrice = entryPrice * (1 + slOffset);
+            }
+            
+            console.log(`${userPrefix} ⚠️ No SL price in webhook, calculated from position entry: ${slPrice} (entry: ${entryPrice}, offset: ${slOffset * 100}%)`);
+          }
+        } catch (err: any) {
+          console.warn(`${userPrefix} Failed to calculate SL from position:`, err?.message || err);
+        }
+      }
 
       if (!slPrice) {
         await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, markPrice, "failed", activeMode, strategyId, "No SL price provided");
@@ -912,7 +987,7 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
         return res.status(400).json({
           success: false,
           status: "missing_sl_price",
-          message: "Stop Loss signal requires sl_price, stop_loss_price, or price field",
+          message: "Stop Loss signal requires sl_price, stop_loss_price, price, or similar field",
         });
       }
 
@@ -1103,7 +1178,7 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             });
           }
 
-          await logTrade(userId, eventId, exchangeName, symbol, eventType, position.size, slPrice, "filled", activeMode, strategyId);
+          await logTrade(userId, eventId, exchangeName, symbol, eventType, position.size, slPrice, "filled", activeMode, strategyId, undefined, position.side);
           await updateWebhookStatus(eventId, userId, "executed");
 
           return res.json({
@@ -1645,14 +1720,32 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
 async function logTrade(
   userId: string, eventId: string, exchange: string, symbol: string,
   eventType: string, qty: number, price: number, status: string,
-  mode: string, strategyId: string, errorMessage?: string
+  mode: string, strategyId: string, errorMessage?: string,
+  positionSide?: string // Optional: 'LONG' or 'SHORT'
 ) {
+  // Determine side based on position if provided, otherwise infer from event type
+  let side: string;
+  
+  if (positionSide) {
+    // For exit/close signals: use opposite of position side
+    if (eventType.includes("exit") || eventType.includes("close") || 
+        eventType.includes("tp") || eventType.includes("sl")) {
+      side = positionSide === "LONG" ? "SELL" : "BUY";
+    } else {
+      // For entry signals: use same as position side
+      side = positionSide === "LONG" ? "BUY" : "SELL";
+    }
+  } else {
+    // Fallback to old behavior for backward compatibility
+    side = eventType.includes("long") || eventType.includes("buy") ? "BUY" : "SELL";
+  }
+  
   await supabase.from("trades").insert({
     user_id: userId,
     event_id: eventId,
     exchange,
     symbol,
-    side: eventType.includes("long") || eventType.includes("buy") ? "BUY" : "SELL",
+    side,
     event_type: eventType,
     qty,
     price,
