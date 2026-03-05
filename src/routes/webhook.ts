@@ -284,9 +284,8 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
     }
 
     if ((!exchangeSetup && !wantsBoth) || (wantsBoth && allExchangeSetups.length === 0)) {
-      if (activeMode === "real") {
-        // Queue the signal for later execution when API keys are configured
-        console.log(`⏳ No API keys configured, queueing ${eventType} signal`);
+      // No API keys configured - queue the signal regardless of mode
+      console.log(`⏳ No API keys configured, queueing ${eventType} signal`);
         
         // Check if already queued
         const { data: existingQueue } = await supabase
@@ -355,7 +354,6 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             queueUntil: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
           },
         });
-      }
     }
 
     // 7. Get mark price for quantity calculation
@@ -374,7 +372,7 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
 
     // 8. Handle CLOSE events (exit, close_all, exit_long, exit_short)
     if (eventType === "exit" || eventType === "close_all" || eventType.startsWith("exit_")) {
-      if (activeMode === "real" && allExchangeSetups.length > 0) {
+      if (allExchangeSetups.length > 0) {
         const errors: string[] = [];
 
         for (const setup of allExchangeSetups) {
@@ -433,28 +431,75 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
           message: `Close failed on: ${errors.join(", ")}`,
         });
       } else {
-        // Demo mode — just log
-        const targets = wantsBoth && allExchangeSetups.length > 0 ? allExchangeSetups : exchangeSetup ? [exchangeSetup] : [];
-        for (const setup of targets) {
-          await logTrade(
-            userId,
-            eventId,
-            setup.exchange,
-            symbol,
-            eventType,
-            0,
-            markPrice,
-            "demo_executed",
-            activeMode,
-            strategyId
-          );
+        // No API keys - queue the signal
+        console.log(`⏳ No API keys configured, queueing ${eventType} signal`);
+        
+        // Check if already queued
+        const { data: existingQueue } = await supabase
+          .from("exit_signal_queue")
+          .select("id")
+          .eq("user_id", userId)
+          .eq("event_id", eventId)
+          .single();
+
+        if (existingQueue) {
+          console.log(`ℹ️ Signal already queued: ${eventId}`);
+          await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, markPrice, "queued", activeMode, strategyId, "Already queued - waiting for API keys");
+          await updateWebhookStatus(eventId, userId, "processed");
+          
+          return res.json({
+            success: true,
+            status: "queued",
+            message: `Signal queued for ${symbol}. Will execute when API keys are configured.`,
+          });
         }
+
+        // Add to queue
+        const { error: queueError } = await supabase
+          .from("exit_signal_queue")
+          .insert({
+            user_id: userId,
+            event_id: eventId,
+            event_type: eventType,
+            symbol,
+            exchange: wantsBoth ? "both" : rawExchange,
+            side: eventType.includes("long") || eventType.includes("buy") ? "LONG" : "SHORT",
+            payload: req.body,
+            tp_price: extractTPPrice(req.body),
+            sl_price: extractSLPrice(req.body),
+            partial_percent: extractPartialPercentage(req.body),
+            status: "pending",
+            retry_count: 0,
+            max_retries: 10,
+            created_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
+          });
+
+        if (queueError) {
+          console.error("Failed to queue signal:", queueError.message);
+          await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, markPrice, "failed", activeMode, strategyId, "Failed to queue");
+          await updateWebhookStatus(eventId, userId, "failed");
+          
+          return res.status(500).json({
+            success: false,
+            status: "queue_error",
+            message: "Failed to queue signal",
+          });
+        }
+
+        console.log(`✅ Queued ${eventType} for ${symbol} on ${wantsBoth ? "both" : rawExchange}`);
+        await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, markPrice, "queued", activeMode, strategyId, "Queued - waiting for API keys");
         await updateWebhookStatus(eventId, userId, "processed");
+
         return res.json({
           success: true,
-          status: "demo_executed",
-          message: `[DEMO] Close signal logged: ${symbol}`,
-          details: { symbol, eventType, mode: activeMode },
+          status: "queued",
+          message: `Signal queued for ${symbol}. Configure API keys to auto-execute.`,
+          details: { 
+            symbol, 
+            eventType, 
+            queueUntil: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
+          },
         });
       }
     }
@@ -474,7 +519,7 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
         });
       }
 
-      if (activeMode === "real" && exchangeSetup) {
+      if (exchangeSetup) {
         try {
           // Get current position
           const positions = await exchangeSetup.client.getPositions();
@@ -693,14 +738,77 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
           });
         }
       } else {
-        // Demo mode — just log
-        await logTrade(userId, eventId, exchangeName, symbol, eventType, partialPercent ? (partialPercent / 100) : 1, tpPrice || markPrice, "demo_executed", activeMode, strategyId);
+        // No API keys configured - queue the TP/SL signal
+        console.log(`⏳ No API keys configured, queueing ${eventType} signal`);
+        
+        // Check if already queued
+        const { data: existingQueue } = await supabase
+          .from("exit_signal_queue")
+          .select("id")
+          .eq("user_id", userId)
+          .eq("event_id", eventId)
+          .single();
+
+        if (existingQueue) {
+          console.log(`ℹ️ Signal already queued: ${eventId}`);
+          await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, tpPrice || markPrice, "queued", activeMode, strategyId, "Already in queue");
+          await updateWebhookStatus(eventId, userId, "processed");
+          
+          return res.json({
+            success: true,
+            status: "queued",
+            message: `Exit signal already queued for ${symbol}. Will execute when position opens.`,
+          });
+        }
+
+        // Add to queue
+        const { error: queueError } = await supabase
+          .from("exit_signal_queue")
+          .insert({
+            user_id: userId,
+            event_id: eventId,
+            event_type: eventType,
+            symbol,
+            exchange: wantsBoth ? "both" : rawExchange,
+            side: eventType.includes("long") || eventType.includes("buy") ? "LONG" : "SHORT",
+            payload: req.body,
+            tp_price: tpPrice,
+            sl_price: null,
+            partial_percent: partialPercent,
+            status: "pending",
+            retry_count: 0,
+            max_retries: 5,
+            created_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+          });
+
+        if (queueError) {
+          console.error("Failed to queue exit signal:", queueError.message);
+          await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, tpPrice || markPrice, "failed", activeMode, strategyId, "Failed to queue");
+          await updateWebhookStatus(eventId, userId, "failed");
+          
+          return res.status(500).json({
+            success: false,
+            status: "queue_error",
+            message: "Failed to queue exit signal",
+          });
+        }
+
+        console.log(`✅ Queued ${eventType} for ${symbol} on ${wantsBoth ? "both" : rawExchange}`);
+        await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, tpPrice || markPrice, "queued", activeMode, strategyId, "Queued - no position yet");
         await updateWebhookStatus(eventId, userId, "processed");
+
         return res.json({
           success: true,
-          status: "demo_executed",
-          message: `[DEMO] ${eventType.toUpperCase()} signal: ${symbol}${tpPrice ? ` @ ${tpPrice}` : ""}${partialPercent ? ` (${partialPercent}%)` : ""}`,
-          details: { symbol, eventType, price: tpPrice, percentage: partialPercent, mode: activeMode },
+          status: "queued",
+          message: `Exit signal queued for ${symbol}. Will auto-execute when position opens.`,
+          details: { 
+            symbol, 
+            eventType, 
+            tpPrice, 
+            partialPercent,
+            queueUntil: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+          },
         });
       }
     }
@@ -719,7 +827,7 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
         });
       }
 
-      if (activeMode === "real" && exchangeSetup) {
+      if (exchangeSetup) {
         try {
           // Get current position
           const positions = await exchangeSetup.client.getPositions();
@@ -925,14 +1033,76 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
           });
         }
       } else {
-        // Demo mode — just log
-        await logTrade(userId, eventId, exchangeName, symbol, eventType, 1, slPrice, "demo_executed", activeMode, strategyId);
+        // No API keys configured - queue the SL signal
+        console.log(`⏳ No API keys configured, queueing ${eventType} signal`);
+        
+        // Check if already queued
+        const { data: existingQueue } = await supabase
+          .from("exit_signal_queue")
+          .select("id")
+          .eq("user_id", userId)
+          .eq("event_id", eventId)
+          .single();
+
+        if (existingQueue) {
+          console.log(`ℹ️ Signal already queued: ${eventId}`);
+          await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, slPrice, "queued", activeMode, strategyId, "Already in queue");
+          await updateWebhookStatus(eventId, userId, "processed");
+          
+          return res.json({
+            success: true,
+            status: "queued",
+            message: `Stop Loss already queued for ${symbol}. Will execute when position opens.`,
+          });
+        }
+
+        // Add to queue
+        const { error: queueError } = await supabase
+          .from("exit_signal_queue")
+          .insert({
+            user_id: userId,
+            event_id: eventId,
+            event_type: eventType,
+            symbol,
+            exchange: wantsBoth ? "both" : rawExchange,
+            side: eventType.includes("long") || eventType.includes("buy") ? "LONG" : "SHORT",
+            payload: req.body,
+            tp_price: null,
+            sl_price: slPrice,
+            partial_percent: null,
+            status: "pending",
+            retry_count: 0,
+            max_retries: 5,
+            created_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+          });
+
+        if (queueError) {
+          console.error("Failed to queue SL signal:", queueError.message);
+          await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, slPrice, "failed", activeMode, strategyId, "Failed to queue");
+          await updateWebhookStatus(eventId, userId, "failed");
+          
+          return res.status(500).json({
+            success: false,
+            status: "queue_error",
+            message: "Failed to queue Stop Loss signal",
+          });
+        }
+
+        console.log(`✅ Queued ${eventType} for ${symbol} on ${wantsBoth ? "both" : rawExchange}`);
+        await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, slPrice, "queued", activeMode, strategyId, "Queued - no position yet");
         await updateWebhookStatus(eventId, userId, "processed");
+
         return res.json({
           success: true,
-          status: "demo_executed",
-          message: `[DEMO] ${eventType === "sl" ? "STOP LOSS" : "SL UPDATE"} signal: ${symbol} @ ${slPrice}`,
-          details: { symbol, eventType, price: slPrice, mode: activeMode },
+          status: "queued",
+          message: `Stop Loss queued for ${symbol}. Will auto-execute when position opens.`,
+          details: { 
+            symbol, 
+            eventType, 
+            slPrice,
+            queueUntil: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+          },
         });
       }
     }
@@ -1270,29 +1440,78 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
         });
       }
     } else {
-      // DEMO mode — log only, no real execution
-      const targets = wantsBoth && allExchangeSetups.length > 0 ? allExchangeSetups : exchangeSetup ? [exchangeSetup] : [];
-      for (const setup of targets) {
-        await logTrade(
-          userId,
-          eventId,
-          setup.exchange,
-          symbol,
-          eventType,
-          qty,
-          markPrice,
-          "demo_executed",
-          activeMode,
-          strategyId
-        );
+      // No API keys configured - queue the entry signal
+      console.log(`⏳ No API keys configured, queueing ${eventType} signal`);
+      
+      // Check if already queued
+      const { data: existingQueue } = await supabase
+        .from("exit_signal_queue")
+        .select("id")
+        .eq("user_id", userId)
+        .eq("event_id", eventId)
+        .single();
+
+      if (existingQueue) {
+        console.log(`ℹ️ Signal already queued: ${eventId}`);
+        await logTrade(userId, eventId, exchangeName, symbol, eventType, qty, markPrice, "queued", activeMode, strategyId, "Already queued - waiting for API keys");
+        await updateWebhookStatus(eventId, userId, "processed");
+        
+        return res.json({
+          success: true,
+          status: "queued",
+          message: `Signal queued for ${symbol}. Will execute when API keys are configured.`,
+        });
       }
+
+      // Add to queue
+      const { error: queueError } = await supabase
+        .from("exit_signal_queue")
+        .insert({
+          user_id: userId,
+          event_id: eventId,
+          event_type: eventType,
+          symbol,
+          exchange: wantsBoth ? "both" : rawExchange,
+          side: side === "BUY" ? "LONG" : "SHORT",
+          payload: req.body,
+          tp_price: extractTPPrice(req.body),
+          sl_price: extractSLPrice(req.body),
+          partial_percent: extractPartialPercentage(req.body),
+          status: "pending",
+          retry_count: 0,
+          max_retries: 10,
+          created_at: new Date().toISOString(),
+          expires_at: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
+        });
+
+      if (queueError) {
+        console.error("Failed to queue signal:", queueError.message);
+        await logTrade(userId, eventId, exchangeName, symbol, eventType, qty, markPrice, "failed", activeMode, strategyId, "Failed to queue");
+        await updateWebhookStatus(eventId, userId, "failed");
+        
+        return res.status(500).json({
+          success: false,
+          status: "queue_error",
+          message: "Failed to queue signal",
+        });
+      }
+
+      console.log(`✅ Queued ${eventType} for ${symbol} on ${wantsBoth ? "both" : rawExchange}`);
+      await logTrade(userId, eventId, exchangeName, symbol, eventType, qty, markPrice, "queued", activeMode, strategyId, "Queued - waiting for API keys");
       await updateWebhookStatus(eventId, userId, "processed");
 
       return res.json({
         success: true,
-        status: "demo_executed",
-        message: `[DEMO] ${eventType} ${symbol} qty=${qty} lev=${clampedLeverage}x`,
-        details: { symbol, side, qty, leverage: clampedLeverage, eventType, mode: activeMode, markPrice },
+        status: "queued",
+        message: `Signal queued for ${symbol}. Configure API keys to auto-execute.`,
+        details: { 
+          symbol, 
+          eventType, 
+          side,
+          qty,
+          leverage: clampedLeverage,
+          queueUntil: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
+        },
       });
     }
     
