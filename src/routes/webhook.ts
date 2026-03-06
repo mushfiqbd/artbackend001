@@ -226,7 +226,18 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
         const baseEventId = payload.event_id || `${Date.now()}_${symbol}_${eventType}`;
         const eventId = `${baseEventId}_user_${userId.substring(0, 8)}`;
         
-        const strategyId = payload.strategy_id || "manual";
+        const strategyId = payload.strategy_id || 
+                           payload.strategy_name || 
+                           payload.strategy_order_id ||
+                           payload.alert_id ||
+                           (payload.strategy && typeof payload.strategy === 'object' && 'order' in payload.strategy && payload.strategy.order && typeof payload.strategy.order === 'object' && 'id' in payload.strategy.order ? (payload.strategy.order as any).id : null) ||
+                           (payload.strategy && typeof payload.strategy === 'object' && 'name' in payload.strategy ? (payload.strategy as any).name : null) ||
+                           "manual";
+            
+        // Log if using fallback "manual"
+        if (strategyId === "manual") {
+          console.log(`${userPrefix} ⚠️ No strategy_id in webhook, using "manual". Send 'strategy_id' field from TradingView.`);
+        }
 
         if (!symbol) {
           console.error(`${userPrefix} ❌ Missing symbol`);
@@ -485,6 +496,17 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
 
         for (const setup of allExchangeSetups) {
           try {
+            // Check if position exists on THIS specific exchange before trying to close
+            const positions = await setup.client.getPositions();
+            const pos = positions.find((p) => p.symbol === symbol);
+            
+            if (!pos) {
+              // No position on this exchange - skip and mark as ignored
+              console.log(`ℹ️ ${setup.exchange.toUpperCase()}: No position for ${symbol}, skipping close`);
+              errors.push(`${setup.exchange}: No open position for ${symbol} (IGNORED)`);
+              continue; // Skip to next exchange
+            }
+            
             let result: any;
             if (setup.client instanceof BinanceClient) {
               result = await setup.client.closePosition(symbol);
@@ -525,21 +547,32 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
           }
         }
 
-        if (errors.length === 0) {
-          await updateWebhookStatus(eventId, userId, "executed");
+        // Separate actual errors from IGNORED (no position) cases
+        const actualErrors = errors.filter(e => !e.includes("(IGNORED)"));
+        const ignoredExchanges = errors.filter(e => e.includes("(IGNORED)"));
+        
+        if (actualErrors.length === 0) {
+          // Success or partial success
+          const status = ignoredExchanges.length > 0 && ignoredExchanges.length < allExchangeSetups.length ? "partially_executed" : "executed";
+          const message = ignoredExchanges.length > 0 
+            ? `Position closed on ${allExchangeSetups.length - ignoredExchanges.length}/${allExchangeSetups.length} exchanges. ${ignoredExchanges.length} exchange(s) had no position.`
+            : `Position closed on ${wantsBoth ? "all exchanges" : exchangeName}: ${symbol}`;
+          
+          await updateWebhookStatus(eventId, userId, status === "executed" ? "executed" : "processed");
           return res.json({
             success: true,
-            status: "executed",
-            message: `Position closed on ${wantsBoth ? "all exchanges" : exchangeName}: ${symbol}`,
-            details: { symbol, eventType, mode: activeMode },
+            status: status,
+            message: message,
+            details: { symbol, eventType, mode: activeMode, ignoredCount: ignoredExchanges.length },
           });
         }
 
+        // Real errors occurred
         await updateWebhookStatus(eventId, userId, "failed");
         return res.status(500).json({
           success: false,
           status: "execution_failed",
-          message: `Close failed on: ${errors.join(", ")}`,
+          message: `Close failed on: ${actualErrors.join(", ")}`,
         });
       } else {
         // No API keys - queue the signal
@@ -1395,36 +1428,45 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
       }
     }
 
-    // 10. Get symbol info for rounding
+    // 10. Get symbol info for rounding AND AVAILABILITY CHECK
     let stepSize = 0.001;
     let minQty = 0.001;
+    let isSymbolLive = true; // Assume live unless proven otherwise
 
     if (exchangeSetup) {
       try {
         let symInfo: any;
         if (exchangeSetup.client instanceof BinanceClient) {
           symInfo = await exchangeSetup.client.getSymbolInfo(symbol);
-        } else {
+        } else if (exchangeSetup.client instanceof BybitClient) {
+          // For Bybit, check symbol availability FIRST
+          isSymbolLive = await (exchangeSetup.client as BybitClient).isSymbolAvailable(symbol);
+          if (!isSymbolLive) {
+            console.log(`⚠️ ${exchangeSetup.exchange.toUpperCase()}: Symbol ${symbol} is not live/available, skipping`);
+            // Skip this exchange - symbol not available
+            continue; // Skip to next user in multi-user loop
+          }
           symInfo = await (exchangeSetup.client as BybitClient).getSymbolInfo(symbol);
         }
         if (symInfo) {
           stepSize = symInfo.stepSize;
           minQty = symInfo.minQty;
         }
-      } catch {
-        console.warn("Failed to get symbol info, using defaults");
+      } catch (err: any) {
+        console.warn(`Failed to get symbol info for ${symbol}, using defaults: ${err.message}`);
       }
     }
 
-    qty = roundQtyByStep(qty, stepSize);
+    qty = roundQtyByStep(qty, stepSize, minQty);
 
-    if (qty < minQty) {
-      await logTrade(userId, eventId, exchangeName, symbol, eventType, qty, markPrice, "failed", activeMode, strategyId, `Qty ${qty} below min ${minQty}`);
+    // CRITICAL SAFETY CHECK - Never proceed with zero quantity
+    if (qty <= 0) {
+      await logTrade(userId, eventId, exchangeName, symbol, eventType, qty, markPrice, "failed", activeMode, strategyId, `CRITICAL ERROR: Quantity is zero after rounding (qty=${qty}, stepSize=${stepSize}, minQty=${minQty})`);
       await updateWebhookStatus(eventId, userId, "failed");
-      return res.status(400).json({
+      return res.status(500).json({
         success: false,
-        status: "qty_below_minimum",
-        message: `Qty ${qty} below minimum ${minQty}`,
+        status: "zero_quantity",
+        message: "Quantity calculation failed - would result in zero order",
       });
     }
 
@@ -1517,6 +1559,29 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
               activeMode,
               strategyId
             );
+            
+            // Store strategy_id in positions table for display in Overview/Positions
+            try {
+              await supabase.from("positions").upsert({
+                user_id: userId,
+                exchange: setup.exchange,
+                symbol,
+                side: side === "BUY" ? "LONG" : "SHORT",
+                size: exchangeQty,
+                entry_price: orderResult?.price || markPrice,
+                strategy_id: strategyId,
+                opened_by_webhook_id: eventId,
+                state: "OPEN",
+                opened_at: new Date().toISOString(),
+                leverage: clampedLeverage,
+              }, {
+                onConflict: 'user_id,exchange,symbol,side'
+              });
+              console.log(`💾 ${setup.exchange.toUpperCase()}: Stored strategy_id "${strategyId}" for ${symbol}`);
+            } catch (dbErr: any) {
+              console.warn(`⚠️ Failed to store strategy_id in positions: ${dbErr.message}`);
+              // Don't fail the trade - just log warning
+            }
           } catch (orderErr: any) {
             console.error(`❌ ${setup.exchange.toUpperCase()} order failed: ${orderErr.message}`);
             errors.push(`${setup.exchange.toUpperCase()}: ${orderErr.message}`);
