@@ -127,6 +127,43 @@ export class BybitClient {
     }
   }
 
+  // ===== Symbol Info & Availability =====
+
+  async getSymbolInfo(symbol: string): Promise<{
+    tickSize: number;
+    stepSize: number;
+    minQty: number;
+    minNotional: number;
+  } | null> {
+    const result = await this.get("/v5/market/instruments-info", {
+      category: "linear",
+      symbol,
+    });
+    const info = result.list?.[0];
+    if (!info) return null;
+
+    return {
+      tickSize: parseFloat(info.priceFilter?.tickSize || "0.01"),
+      stepSize: parseFloat(info.lotSizeFilter?.qtyStep || "0.001"),
+      minQty: parseFloat(info.lotSizeFilter?.minOrderQty || "0.001"),
+      minNotional: parseFloat(info.lotSizeFilter?.minNotionalValue || "5"),
+    };
+  }
+
+  async isSymbolAvailable(symbol: string): Promise<boolean> {
+    try {
+      const result = await this.get("/v5/market/instruments-info", {
+        category: "linear",
+        symbol,
+      });
+      
+      return result.list && result.list.length > 0;
+    } catch (err: any) {
+      console.warn(`Bybit: Symbol ${symbol} not available:`, err?.message || err);
+      return false;
+    }
+  }
+
   // ===== Place Order =====
 
   async placeOrder(params: {
@@ -183,29 +220,6 @@ export class BybitClient {
       quantity: pos.size,
       reduceOnly: true,
     });
-  }
-
-  // ===== Symbol Info =====
-
-  async getSymbolInfo(symbol: string): Promise<{
-    tickSize: number;
-    stepSize: number;
-    minQty: number;
-    minNotional: number;
-  } | null> {
-    const result = await this.get("/v5/market/instruments-info", {
-      category: "linear",
-      symbol,
-    });
-    const info = result.list?.[0];
-    if (!info) return null;
-
-    return {
-      tickSize: parseFloat(info.priceFilter?.tickSize || "0.01"),
-      stepSize: parseFloat(info.lotSizeFilter?.qtyStep || "0.001"),
-      minQty: parseFloat(info.lotSizeFilter?.minOrderQty || "0.001"),
-      minNotional: parseFloat(info.lotSizeFilter?.minNotionalValue || "5"),
-    };
   }
 
   // ===== Trade History =====
