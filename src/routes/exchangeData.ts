@@ -36,10 +36,52 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
           // Fetch open positions
           if (client instanceof BinanceClient) {
             const positions = await client.getPositions();
-            openPositions.push(...positions);
+            // Enrich with strategy_id from database
+            const enrichedPositions = await Promise.all(positions.map(async (pos: any) => {
+              try {
+                const dbPos = await supabase
+                  .from("positions")
+                  .select("strategy_id, opened_by_webhook_id")
+                  .eq("user_id", userId)
+                  .eq("exchange", exchange)
+                  .eq("symbol", pos.symbol)
+                  .eq("side", pos.side)
+                  .eq("state", "OPEN")
+                  .single();
+                
+                return {
+                  ...pos,
+                  strategy_id: dbPos.data?.strategy_id || null,
+                };
+              } catch {
+                return pos; // No DB record, return as-is
+              }
+            }));
+            openPositions.push(...enrichedPositions);
           } else if (client instanceof BybitClient) {
             const positions = await client.getPositions();
-            openPositions.push(...positions);
+            // Enrich with strategy_id from database
+            const enrichedPositions = await Promise.all(positions.map(async (pos: any) => {
+              try {
+                const dbPos = await supabase
+                  .from("positions")
+                  .select("strategy_id, opened_by_webhook_id")
+                  .eq("user_id", userId)
+                  .eq("exchange", exchange)
+                  .eq("symbol", pos.symbol)
+                  .eq("side", pos.side)
+                  .eq("state", "OPEN")
+                  .single();
+                
+                return {
+                  ...pos,
+                  strategy_id: dbPos.data?.strategy_id || null,
+                };
+              } catch {
+                return pos; // No DB record, return as-is
+              }
+            }));
+            openPositions.push(...enrichedPositions);
           }
 
           // Fetch income/funding (Binance only for now)
