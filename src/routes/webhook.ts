@@ -1428,10 +1428,9 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
       }
     }
 
-    // 10. Get symbol info for rounding AND AVAILABILITY CHECK
+    // 10. Get symbol info for rounding (availability check moved inside exchange loop)
     let stepSize = 0.001;
     let minQty = 0.001;
-    let isSymbolLive = true; // Assume live unless proven otherwise
 
     if (exchangeSetup) {
       try {
@@ -1439,13 +1438,6 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
         if (exchangeSetup.client instanceof BinanceClient) {
           symInfo = await exchangeSetup.client.getSymbolInfo(symbol);
         } else if (exchangeSetup.client instanceof BybitClient) {
-          // For Bybit, check symbol availability FIRST
-          isSymbolLive = await (exchangeSetup.client as BybitClient).isSymbolAvailable(symbol);
-          if (!isSymbolLive) {
-            console.log(`⚠️ ${exchangeSetup.exchange.toUpperCase()}: Symbol ${symbol} is not live/available, skipping`);
-            // Skip this exchange - symbol not available
-            continue; // Skip to next user in multi-user loop
-          }
           symInfo = await (exchangeSetup.client as BybitClient).getSymbolInfo(symbol);
         }
         if (symInfo) {
@@ -1490,6 +1482,16 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             }
           } catch (levErr: any) {
             console.warn(`⚠️ Leverage set failed for ${setup.exchange} ${symbol}: ${levErr.message}. Continuing with order...`);
+          }
+
+          // For Bybit: Check if symbol is available BEFORE proceeding
+          if (setup.client instanceof BybitClient) {
+            const isSymbolLive = await (setup.client as BybitClient).isSymbolAvailable(symbol);
+            if (!isSymbolLive) {
+              console.log(`⚠️ ${setup.exchange.toUpperCase()}: Symbol ${symbol} is not live/available, skipping this exchange`);
+              errors.push(`${setup.exchange.toUpperCase()}: Symbol ${symbol} not available`);
+              continue; // Skip to next exchange
+            }
           }
 
           // Get exchange-specific symbol info and adjust quantity
