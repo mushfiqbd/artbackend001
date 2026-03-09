@@ -182,6 +182,8 @@ async function calculateFallbackQuantity(userId: string, markPrice: number): Pro
 
 // ===== POST /webhook — Universal Webhook Handler =====
 router.post("/", async (req: Request, res: Response): Promise<Response | void> => {
+  let baseEventId: string | undefined;
+  
   try {
     // 1. Validate basic structure
     const payload = webhookSchema.parse(req.body);
@@ -207,7 +209,8 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
     const symbol = resolveSymbol(payload);
 
     // 3. Distributed lock - Prevent duplicate processing across multiple instances
-    const baseEventId = payload.event_id || `${Date.now()}_${symbol || 'unknown'}_${eventType}`;
+     // 3. Distributed lock - Prevent duplicate processing across multiple instances
+     baseEventId = payload.event_id || `${Date.now()}_${symbol || 'unknown'}_${eventType}`;
     const lockKey = `webhook_lock_${baseEventId}`;
     
     try {
