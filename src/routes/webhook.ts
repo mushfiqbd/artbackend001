@@ -1812,16 +1812,38 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
   } // Close the for (const settings of allSettings) loop
   
   // All users processed successfully
-  return res.json({
+  const response = res.json({
     success: true,
     status: "processed",
     message: `Webhook processed for ${allSettings.length} user(s)`,
     results: userResults
   });
   
+  // Release distributed lock after successful processing
+  if (baseEventId) {
+   const lockKey = `webhook_lock_${baseEventId}`;
+    try {
+      await supabase.rpc('release_webhook_lock', { p_lock_key: lockKey });
+     console.log(`🔓 Released distributed lock for webhook: ${baseEventId}`);
+    } catch (err: any) {
+     console.warn(`⚠️ Failed to release lock: ${err.message}`);
+    }
+  }
+  
+  return response;
+  
 } catch (err: any) {
   // Outer error handler for validation and system errors
   if (err instanceof z.ZodError) {
+    // Release lock on validation error
+   if (baseEventId) {
+     const lockKey = `webhook_lock_${baseEventId}`;
+      try {
+        await supabase.rpc('release_webhook_lock', { p_lock_key: lockKey });
+      } catch (releaseErr: any) {
+       console.warn(`⚠️ Failed to release lock: ${releaseErr.message}`);
+      }
+    }
     return res.status(400).json({
       success: false,
       status: "validation_error",
@@ -1829,6 +1851,17 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
     });
   }
   console.error("Webhook error:", err?.message || err);
+  
+  // Release lock on system error
+  if (baseEventId) {
+   const lockKey = `webhook_lock_${baseEventId}`;
+    try {
+      await supabase.rpc('release_webhook_lock', { p_lock_key: lockKey });
+    } catch (releaseErr: any) {
+     console.warn(`⚠️ Failed to release lock: ${releaseErr.message}`);
+    }
+  }
+  
   return res.status(500).json({ success: false, status: "error", message: "Webhook processing failed" });
 }
 });
