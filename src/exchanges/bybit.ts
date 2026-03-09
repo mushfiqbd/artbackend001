@@ -210,16 +210,33 @@ export class BybitClient {
   // ===== Close Position =====
 
   async closePosition(symbol: string): Promise<any> {
-    const positions = await this.getPositions(symbol);
-    const pos = positions.find((p) => p.symbol === symbol);
-    if (!pos) throw new Error(`No open position for ${symbol}`);
+    // Get ALL positions first (more reliable than filtering by symbol)
+    const allPositions = await this.getPositions();
+    
+    // Find the specific position
+    const pos = allPositions.find((p) => p.symbol === symbol);
+    
+    if (!pos) {
+      console.error(`❌ Bybit: No open position found for ${symbol}. Available: ${allPositions.map(p => p.symbol).join(", ") || "NONE"}`);
+      throw new Error(`No open position for ${symbol}`);
+    }
 
-    return this.placeOrder({
-      symbol,
-      side: pos.side === "LONG" ? "Sell" : "Buy",
-      quantity: pos.size,
-      reduceOnly: true,
-    });
+    console.log(`📤 Bybit: Closing ${symbol} ${pos.side} position of size ${pos.size}`);
+    
+    try {
+      const result = await this.placeOrder({
+        symbol,
+        side: pos.side === "LONG" ? "Sell" : "Buy",
+        quantity: pos.size,
+        reduceOnly: true,
+      });
+      
+      console.log(`✅ Bybit: Position closed successfully for ${symbol}`);
+      return result;
+    } catch (err: any) {
+      console.error(`❌ Bybit: Failed to close position for ${symbol}:`, err.message);
+      throw err;
+    }
   }
 
   // ===== Trade History =====
