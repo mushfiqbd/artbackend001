@@ -846,23 +846,47 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             closeQty = (position.size * effectivePercent) / 100;
           }
 
-          // Round quantity
+          // Round quantity and validate minimum
           let stepSize = 0.001;
+          let minQty = 0.001;
           try {
             const symInfo = await exchangeSetup.client.getSymbolInfo(symbol);
-            if (symInfo) stepSize = symInfo.stepSize;
+            if (symInfo) {
+              stepSize = symInfo.stepSize;
+              minQty = symInfo.minQty || 0.001;
+            }
           } catch {}
           closeQty = roundQtyByStep(closeQty, stepSize);
+          
+          // Ensure closeQty doesn't exceed position size
+          if (closeQty > position.size) {
+            console.log(`⚠️ Close qty ${closeQty} exceeds position ${position.size}, using position size`);
+            closeQty = position.size;
+          }
+          
+          // Ensure minimum quantity
+          if (closeQty < minQty) {
+            console.log(`⚠️ Close qty ${closeQty} below minimum ${minQty}, adjusting to minimum`);
+            closeQty = Math.max(minQty, position.size); // Use position size if smaller than min
+          }
+          
+          // If position is smaller than minimum, close entire position (exchange will accept it)
+          if (position.size > 0 && position.size < minQty) {
+            console.log(`⚠️ Position size ${position.size} below minimum ${minQty}, closing entire position`);
+            closeQty = position.size;
+          }
 
-          // Place reduce-only order
+          // Place reduce-only order - FORCE MARKET for better fill rate
           let result: any;
+          const forceMarket = true; // Always use MARKET for TP/SL to avoid price validation errors
+          
           if (exchangeSetup.client instanceof BinanceClient) {
             result = await exchangeSetup.client.placeOrder({
               symbol,
               side: position.side === "LONG" ? "SELL" : "BUY",
               quantity: closeQty,
-              type: tpPrice ? "LIMIT" : "MARKET",
-              price: tpPrice,
+              type: forceMarket ? "MARKET" : (tpPrice ? "LIMIT" : "MARKET"),
+              price: forceMarket ? undefined : tpPrice,
               reduceOnly: true,
             });
           } else if (exchangeSetup.client instanceof BybitClient) {
@@ -870,8 +894,8 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
               symbol,
               side: position.side === "LONG" ? "Sell" : "Buy",
               quantity: closeQty,
-              type: tpPrice ? "Limit" : "Market",
-              price: tpPrice,
+              type: forceMarket ? "Market" : (tpPrice ? "Limit" : "Market"),
+              price: forceMarket ? undefined : tpPrice,
               reduceOnly: true,
             });
           }
