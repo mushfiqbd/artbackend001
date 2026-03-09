@@ -12,6 +12,7 @@ import positionsRoutes from "./routes/positions";
 
 // Start background services
 import "./services/pendingEntryMonitor"; // Auto-starts pending entry timeout monitor
+import "./services/exitSignalCleanup"; // Auto-starts exit signal queue cleanup
 
 const app = express();
 
