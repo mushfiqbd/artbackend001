@@ -202,6 +202,37 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
 
     console.log(`🔑 Webhook authenticated for ${allSettings.length} user(s) with this secret`);
 
+    // 2.5 Resolve flexible fields BEFORE distributed lock
+    const eventType = resolveEventType(payload);
+    const symbol = resolveSymbol(payload);
+
+    // 3. Distributed lock - Prevent duplicate processing across multiple instances
+    const baseEventId = payload.event_id || `${Date.now()}_${symbol || 'unknown'}_${eventType}`;
+    const lockKey = `webhook_lock_${baseEventId}`;
+    
+    try {
+      // Try to acquire lock (expires after 30 seconds)
+      const { data: lockData, error: lockError } = await supabase.rpc('try_acquire_webhook_lock', {
+        p_lock_key: lockKey,
+        p_instance_id: process.env.HOSTNAME || 'local',
+        p_ttl_seconds: 30
+      });
+      
+      if (lockError || !lockData) {
+        console.log(`⚠️ Webhook already being processed by another instance, skipping: ${baseEventId}`);
+        return res.status(200).json({
+          success: true,
+          status: "already_processing",
+          message: "Webhook already being processed by another instance"
+        });
+      }
+      
+      console.log(`✅ Acquired distributed lock for webhook: ${baseEventId}`);
+    } catch (err: any) {
+      console.warn(`⚠️ Failed to acquire distributed lock: ${err.message}. Proceeding anyway...`);
+      // Don't block - just proceed without locking
+    }
+
     // Process webhook for EACH user with this secret
     const userResults = [];
     
@@ -217,10 +248,6 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
         const rawExchange = (payload.exchange || settings.default_exchange || "binance").toLowerCase();
         const wantsBoth = rawExchange === "both";
         const exchangeName = rawExchange;
-
-        // 3. Resolve flexible fields
-        const eventType = resolveEventType(payload);
-        const symbol = resolveSymbol(payload);
         
         // Make event_id unique per user to allow multiple users with same TradingView alert
         const baseEventId = payload.event_id || `${Date.now()}_${symbol}_${eventType}`;
