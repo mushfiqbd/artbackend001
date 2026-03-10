@@ -36,48 +36,128 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
           // Fetch open positions
           if (client instanceof BinanceClient) {
             const positions = await client.getPositions();
-            // Enrich with strategy_id from database
-            const enrichedPositions = await Promise.all(positions.map(async (pos: any) => {
-              try {
-                const dbPos = await supabase
-                  .from("positions")
-                  .select("strategy_id, opened_by_webhook_id")
-                  .eq("user_id", userId)
-                  .eq("exchange", exchange)
-                  .eq("symbol", pos.symbol)
-                  .eq("side", pos.side)
-                  .eq("state", "OPEN")
-                  .single();
+            console.log(`🔍 Binance: Found ${positions.length} position(s) from exchange API`);
+            
+        // Enrich with strategy_id from database
+        const enrichedPositions = await Promise.all(positions.map(async (pos: any) => {
+          try {
+            // Normalize symbol for DB lookup
+          const normalizedSymbol = pos.symbol
+              .replace('BINANCE:', '')
+              .replace('BYBIT:', '')
+              .replace('.P', '');
+            
+            // Try multiple symbol variations
+          const symbolVariations = [
+              pos.symbol,                    // IMXUSDT
+              normalizedSymbol,              // IMXUSDT
+              `BINANCE:${normalizedSymbol}.P`, // BINANCE:IMXUSDT.P
+              `BYBIT:${normalizedSymbol}`,   // BYBIT:IMXUSDT
+            ];
+            
+            // Normalize side for DB lookup (handle LONG/SHORT vs Buy/Sell)
+          const sideVariations = [
+              pos.side,                      // "LONG" or "SHORT"
+              pos.side === 'LONG' ? 'Buy' : 'Sell', // Convert to webhook format
+              pos.side === 'SHORT' ? 'Buy' : 'Sell',
+            ];
+            
+          console.log(`🔍 Looking up DB for ${pos.symbol}, normalized: ${normalizedSymbol}`);
+            
+            let dbPos = null;
+            
+            // Try all combinations
+            for (const symVar of symbolVariations) {
+            if (dbPos?.data) break;
+              for (const sideVar of sideVariations) {
+              if (dbPos?.data) break;
                 
-                return {
-                  ...pos,
-                  strategy_id: dbPos.data?.strategy_id || null,
-                };
-              } catch {
-                return pos; // No DB record, return as-is
+                // Try uppercase exchange
+                dbPos = await supabase
+                  .from("positions")
+                  .select("strategy_id, opened_by_webhook_id, state")
+                  .eq("user_id", userId)
+                  .eq("exchange", exchange.toUpperCase())
+                  .eq("symbol", symVar)
+                  .eq("side", sideVar)
+                  .order("created_at", { ascending: false })
+                  .limit(1)
+                  .maybeSingle();
+                
+              if (!dbPos?.data) {
+                  // Try lowercase exchange
+                  dbPos = await supabase
+                    .from("positions")
+                    .select("strategy_id, opened_by_webhook_id, state")
+                    .eq("user_id", userId)
+                    .eq("exchange", exchange)
+                    .eq("symbol", symVar)
+                    .eq("side", sideVar)
+                    .order("created_at", { ascending: false })
+                    .limit(1)
+                    .maybeSingle();
+                }
               }
-            }));
+            }
+            
+          if (dbPos?.data) {
+            console.log(`✅ Found DB match: strategy_id="${dbPos.data.strategy_id}"`);
+            return { ...pos, strategy_id: dbPos.data.strategy_id || null, db_state: dbPos.data.state };
+            } else {
+            console.log(`⚠️ No DB match found for ${pos.symbol}`);
+            return pos;
+            }
+          } catch (err: any) {
+          console.log(`⚠️ DB lookup failed: ${err.message}`);
+          return pos;
+          }
+        }));
             openPositions.push(...enrichedPositions);
           } else if (client instanceof BybitClient) {
             const positions = await client.getPositions();
+            console.log(`🔍 Bybit: Found ${positions.length} position(s) from exchange API`);
+            
             // Enrich with strategy_id from database
             const enrichedPositions = await Promise.all(positions.map(async (pos: any) => {
               try {
-                const dbPos = await supabase
+                // First try without state filter (more flexible)
+                let dbPos = await supabase
                   .from("positions")
-                  .select("strategy_id, opened_by_webhook_id")
+                  .select("strategy_id, opened_by_webhook_id, state")
                   .eq("user_id", userId)
                   .eq("exchange", exchange)
                   .eq("symbol", pos.symbol)
                   .eq("side", pos.side)
-                  .eq("state", "OPEN")
-                  .single();
+                  .order("created_at", { ascending: false })
+                  .limit(1)
+                  .maybeSingle();
                 
-                return {
-                  ...pos,
-                  strategy_id: dbPos.data?.strategy_id || null,
-                };
-              } catch {
+                // If no result found, try with state filter
+                if (!dbPos || !dbPos.data) {
+                  dbPos = await supabase
+                    .from("positions")
+                    .select("strategy_id, opened_by_webhook_id, state")
+                    .eq("user_id", userId)
+                    .eq("exchange", exchange)
+                    .eq("symbol", pos.symbol)
+                    .eq("side", pos.side)
+                    .eq("state", "OPEN")
+                    .single();
+                }
+                
+                if (dbPos && dbPos.data) {
+                  console.log(`✅ Found DB match for ${pos.symbol}: strategy_id="${dbPos.data.strategy_id || 'null'}", state="${dbPos.data.state}"`);
+                  return {
+                    ...pos,
+                    strategy_id: dbPos.data.strategy_id || null,
+                    db_state: dbPos.data.state,
+                  };
+                } else {
+                  console.log(`⚠️ No DB record found for ${pos.symbol} on ${exchange}`);
+                  return pos;
+                }
+              } catch (err: any) {
+                console.log(`⚠️ DB lookup failed for ${pos.symbol}: ${err.message}`);
                 return pos; // No DB record, return as-is
               }
             }));
