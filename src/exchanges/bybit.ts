@@ -174,12 +174,22 @@ export class BybitClient {
     price?: number;
     reduceOnly?: boolean;
   }): Promise<any> {
+    // CRITICAL: Validate quantity before sending to Bybit
+    if (params.quantity <= 0) {
+      throw new Error(`Bybit: Invalid quantity ${params.quantity} - must be > 0`);
+    }
+    
+    // Convert to string with proper precision
+    const qtyStr = String(params.quantity);
+    
+    console.log(`📤 Bybit: Placing order - Symbol: ${params.symbol}, Side: ${params.side}, Qty: ${params.quantity} (${qtyStr})`);
+    
     const orderBody: Record<string, any> = {
       category: "linear",
       symbol: params.symbol,
       side: params.side,
       orderType: params.type || "Market",
-      qty: String(params.quantity),
+      qty: qtyStr,
     };
 
     if (params.reduceOnly) orderBody.reduceOnly = true;
