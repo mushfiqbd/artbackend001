@@ -118,8 +118,19 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
               .select("created_at")
               .eq("user_id", userId)
               .eq("symbol", pos.symbol)
-              .eq("exchange", exchange)
+              .in("exchange", [exchange, exchange.toUpperCase()]) // Try both formats
               .ilike("event_type", "%entry%")
+              .order("created_at", { ascending: false })
+              .limit(1)
+              .maybeSingle();
+            
+            // Also try to get from positions table as backup
+            const dbPosition = await supabase
+              .from("positions")
+              .select("created_at")
+              .eq("user_id", userId)
+              .eq("symbol", pos.symbol)
+              .in("exchange", [exchange, exchange.toUpperCase()])
               .order("created_at", { ascending: false })
               .limit(1)
               .maybeSingle();
@@ -128,7 +139,7 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
               ...pos, 
               strategy_id: dbPos.data.strategy_id || null, 
               db_state: dbPos.data.state,
-              created_at: entryTrade?.data?.created_at || new Date().toISOString()
+              created_at: entryTrade?.data?.created_at || dbPosition?.data?.created_at // ✅ FIXED: No more new Date() fallback!
             };
             } else {
             console.log(`⚠️ No DB match found for ${pos.symbol} on ${exchange}`);
@@ -214,7 +225,7 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
          // Skip positions that are marked as CLOSED in database
          // Database is source of truth - exchange API may be delayed
          if (dbPos.data.state === 'CLOSED') {
-           console.log(`⚠️ Skipping ${pos.symbol} - DB shows CLOSED state`);
+           console.log(`⚠️ Skipping ${pos.symbol} on ${exchange} - DB shows CLOSED state`);
            return null; // Filter out this position
          }
          
@@ -224,8 +235,19 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
            .select("created_at")
            .eq("user_id", userId)
            .eq("symbol", pos.symbol)
-           .eq("exchange", exchange)
+           .in("exchange", [exchange, exchange.toUpperCase()]) // Try both formats
            .ilike("event_type", "%entry%")
+           .order("created_at", { ascending: false })
+           .limit(1)
+           .maybeSingle();
+         
+         // Also try to get from positions table as backup
+         const dbPosition = await supabase
+           .from("positions")
+           .select("created_at")
+           .eq("user_id", userId)
+           .eq("symbol", pos.symbol)
+           .in("exchange", [exchange, exchange.toUpperCase()])
            .order("created_at", { ascending: false })
            .limit(1)
            .maybeSingle();
@@ -234,10 +256,10 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
            ...pos, 
            strategy_id: dbPos.data.strategy_id || null, 
            db_state: dbPos.data.state,
-           created_at: entryTrade?.data?.created_at || new Date().toISOString()
+           created_at: entryTrade?.data?.created_at || dbPosition?.data?.created_at // ✅ FIXED: No more new Date() fallback!
          };
            } else {
-         console.log(`⚠️ No DB match found for ${pos.symbol}`);
+         console.log(`⚠️ No DB match found for ${pos.symbol} on ${exchange}`);
          return pos;
            }
           } catch (err: any) {
