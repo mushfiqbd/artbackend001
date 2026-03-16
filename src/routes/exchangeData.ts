@@ -102,7 +102,25 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
             
           if (dbPos?.data) {
             console.log(`✅ Found DB match: strategy_id="${dbPos.data.strategy_id}"`);
-            return { ...pos, strategy_id: dbPos.data.strategy_id || null, db_state: dbPos.data.state };
+            
+            // Get the actual position open time from trades table
+            const entryTrade = await supabase
+              .from("trades")
+              .select("created_at")
+              .eq("user_id", userId)
+              .eq("symbol", pos.symbol)
+              .eq("exchange", exchange)
+              .ilike("event_type", "%entry%")
+              .order("created_at", { ascending: false })
+              .limit(1)
+              .maybeSingle();
+            
+            return { 
+              ...pos, 
+              strategy_id: dbPos.data.strategy_id || null, 
+              db_state: dbPos.data.state,
+              created_at: entryTrade?.data?.created_at || new Date().toISOString()
+            };
             } else {
             console.log(`⚠️ No DB match found for ${pos.symbol}`);
             return pos;
@@ -181,7 +199,25 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
            
         if (dbPos?.data) {
          console.log(`✅ Found DB match: strategy_id="${dbPos.data.strategy_id}"`);
-         return { ...pos, strategy_id: dbPos.data.strategy_id || null, db_state: dbPos.data.state };
+         
+         // Get the actual position open time from trades table
+         const entryTrade = await supabase
+           .from("trades")
+           .select("created_at")
+           .eq("user_id", userId)
+           .eq("symbol", pos.symbol)
+           .eq("exchange", exchange)
+           .ilike("event_type", "%entry%")
+           .order("created_at", { ascending: false })
+           .limit(1)
+           .maybeSingle();
+         
+         return { 
+           ...pos, 
+           strategy_id: dbPos.data.strategy_id || null, 
+           db_state: dbPos.data.state,
+           created_at: entryTrade?.data?.created_at || new Date().toISOString()
+         };
            } else {
          console.log(`⚠️ No DB match found for ${pos.symbol}`);
          return pos;
