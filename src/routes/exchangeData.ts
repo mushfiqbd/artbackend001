@@ -139,11 +139,39 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
               ...pos, 
               strategy_id: dbPos.data.strategy_id || null, 
               db_state: dbPos.data.state,
-              created_at: entryTrade?.data?.created_at || dbPosition?.data?.created_at // ✅ FIXED: No more new Date() fallback!
+              created_at: entryTrade?.data?.created_at || dbPosition?.data?.created_at // ✅ Uses database timestamps only
             };
             } else {
-            console.log(`⚠️ No DB match found for ${pos.symbol} on ${exchange}`);
-            return pos;
+            console.log(`⚠️ No DB match found for ${pos.symbol} on ${exchange}, creating position record...`);
+            
+            // Position exists on exchange but not in database - create a record
+            const { data: newPosition, error: insertError } = await supabase
+              .from("positions")
+              .insert({
+                user_id: userId,
+                exchange: exchange.toUpperCase(),
+                symbol: pos.symbol,
+                side: pos.side,
+                state: "OPEN",
+                strategy_id: "unknown",
+                created_at: new Date().toISOString(), // Use current time as best guess
+                updated_at: new Date().toISOString()
+              })
+              .select("created_at")
+              .single();
+            
+            if (insertError) {
+              console.error(`❌ Failed to create position record: ${insertError.message}`);
+            } else {
+              console.log(`✅ Created position record for ${pos.symbol} on ${exchange}`);
+            }
+            
+            return { 
+              ...pos, 
+              strategy_id: null, 
+              db_state: "OPEN",
+              created_at: newPosition?.created_at || new Date().toISOString()
+            };
             }
           } catch (err: any) {
           console.log(`⚠️ DB lookup failed: ${err.message}`);
@@ -256,11 +284,39 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
            ...pos, 
            strategy_id: dbPos.data.strategy_id || null, 
            db_state: dbPos.data.state,
-           created_at: entryTrade?.data?.created_at || dbPosition?.data?.created_at // ✅ FIXED: No more new Date() fallback!
+           created_at: entryTrade?.data?.created_at || dbPosition?.data?.created_at // ✅ Uses database timestamps only
          };
            } else {
-         console.log(`⚠️ No DB match found for ${pos.symbol} on ${exchange}`);
-         return pos;
+         console.log(`⚠️ No DB match found for ${pos.symbol} on ${exchange}, creating position record...`);
+         
+         // Position exists on exchange but not in database - create a record
+         const { data: newPosition, error: insertError } = await supabase
+           .from("positions")
+           .insert({
+             user_id: userId,
+             exchange: exchange.toUpperCase(),
+             symbol: pos.symbol,
+             side: pos.side,
+             state: "OPEN",
+             strategy_id: "unknown",
+             created_at: new Date().toISOString(), // Use current time as best guess
+             updated_at: new Date().toISOString()
+           })
+           .select("created_at")
+           .single();
+         
+         if (insertError) {
+           console.error(`❌ Failed to create position record: ${insertError.message}`);
+         } else {
+           console.log(`✅ Created position record for ${pos.symbol} on ${exchange}`);
+         }
+         
+         return { 
+           ...pos, 
+           strategy_id: null, 
+           db_state: "OPEN",
+           created_at: newPosition?.created_at || new Date().toISOString()
+         };
            }
           } catch (err: any) {
         console.log(`⚠️ DB lookup failed: ${err.message}`);
