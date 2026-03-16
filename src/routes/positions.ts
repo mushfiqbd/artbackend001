@@ -7,7 +7,7 @@ import { BybitClient } from "../exchanges/bybit";
 
 const router = Router();
 
-// POST /positions/close — Close a position on a specific exchange
+// POST /positions/close — Close a position on BOTH exchanges and update database
 router.post("/close", authMiddleware, async (req: AuthRequest, res: Response): Promise<Response | void> => {
   try {
     const userId = req.userId!;
@@ -22,102 +22,127 @@ router.post("/close", authMiddleware, async (req: AuthRequest, res: Response): P
       });
     }
 
-    // Get the exchange client
+    // Get all exchange clients for this user
     const allClients = await getAllExchangeClients(userId);
-    const setup = allClients.find((c) => c.exchange === exchange);
-
-    if (!setup) {
+    
+    if (allClients.length === 0) {
       return res.status(400).json({
         success: false,
-        status: "no_api_keys",
-        message: `No API keys configured for ${exchange}`
+        status: "no_exchanges",
+        message: "No exchanges configured"
       });
     }
 
-    // Check if position exists
-    let positions: any[] = [];
-    try {
-      if (setup.client instanceof BinanceClient) {
-        positions = await setup.client.getPositions();
-        console.log(`📊 Binance positions: ${positions.length} found`);
-      } else if (setup.client instanceof BybitClient) {
-        positions = await setup.client.getPositions();
-        console.log(`📊 Bybit positions: ${positions.length} found`);
-      }
-    } catch (posErr: any) {
-      console.error("❌ Failed to fetch positions:", posErr.message);
-      throw new Error(`Failed to get positions from ${exchange}: ${posErr.message}`);
-    }
+    const results: any[] = [];
+    let totalClosed = 0;
 
-    const position = positions.find((p) => p.symbol === symbol);
-
-    if (!position) {
-      console.warn(`⚠️ No position found for ${symbol} on ${exchange}. Available positions:`, 
-        positions.map(p => `${p.symbol} (${p.side})`).join(", ") || "NONE");
+    // Try to close on ALL configured exchanges (not just the specified one)
+    for (const setup of allClients) {
+      const targetExchange = setup.exchange;
       
-      return res.status(400).json({
-        success: false,
-        status: "no_position",
-        message: `No open position for ${symbol} on ${exchange}`,
-        details: {
-          availablePositions: positions.map(p => ({
-            symbol: p.symbol,
-            side: p.side,
-            size: p.size
-          }))
+      try {
+        // Get positions from this exchange
+        let positions: any[] = [];
+        try {
+          if (setup.client instanceof BinanceClient) {
+            positions = await setup.client.getPositions();
+          } else if (setup.client instanceof BybitClient) {
+            positions = await setup.client.getPositions();
+          }
+        } catch (posErr: any) {
+          console.error(`❌ Failed to fetch ${targetExchange} positions:`, posErr.message);
+          results.push({
+            exchange: targetExchange,
+            success: false,
+            error: `Failed to get positions: ${posErr.message}`
+          });
+          continue;
         }
-      });
-    }
 
-    console.log(`✅ Found position to close: ${symbol} ${position.side} (size: ${position.size}) on ${exchange}`);
+        // Check if this symbol exists on this exchange
+        const position = positions.find((p) => p.symbol === symbol);
 
-    // Close the position
-    let result: any;
-    try {
-      console.log(`🔄 Closing position on ${exchange}...`);
-      
-      if (setup.client instanceof BinanceClient) {
-        result = await setup.client.closePosition(symbol);
-        console.log(`✅ Binance close executed:`, result);
-      } else if (setup.client instanceof BybitClient) {
-        result = await setup.client.closePosition(symbol);
-        console.log(`✅ Bybit close executed:`, result);
+        if (!position) {
+          console.log(`ℹ️ No position found for ${symbol} on ${targetExchange}, skipping...`);
+          results.push({
+            exchange: targetExchange,
+            symbol,
+            success: false,
+            reason: "No open position"
+          });
+          continue;
+        }
+
+        console.log(`✅ Found position to close: ${symbol} ${position.side} (size: ${position.size}) on ${targetExchange}`);
+
+        // Close the position
+        let result: any;
+        try {
+          console.log(`🔄 Closing position on ${targetExchange}...`);
+          
+          if (setup.client instanceof BinanceClient) {
+            result = await setup.client.closePosition(symbol);
+            console.log(`✅ Binance close executed:`, result);
+          } else if (setup.client instanceof BybitClient) {
+            result = await setup.client.closePosition(symbol);
+            console.log(`✅ Bybit close executed:`, result);
+          }
+          
+          totalClosed++;
+          results.push({
+            exchange: targetExchange,
+            symbol,
+            side: position.side,
+            size: position.size,
+            success: true,
+            pnl: position.unrealizedPnl
+          });
+          
+          // Log the trade for each exchange
+          await supabase.from("trades").insert({
+            user_id: userId,
+            event_id: `manual_close_${Date.now()}_${symbol}_${targetExchange}`,
+            exchange: targetExchange,
+            symbol,
+            side: position.side === "LONG" ? "SELL" : "BUY",
+            event_type: "manual_close",
+            qty: position.size,
+            price: result?.price || position.markPrice || 0,
+            status: "filled",
+            mode: "real",
+            strategy_id: "manual",
+            error_message: null,
+          });
+          
+        } catch (closeErr: any) {
+          console.error(`❌ Failed to close position on ${targetExchange}:`, closeErr.message);
+          results.push({
+            exchange: targetExchange,
+            symbol,
+            success: false,
+            error: closeErr.message
+          });
+        }
+        
+      } catch (exchangeErr: any) {
+        console.error(`❌ Error processing ${targetExchange}:`, exchangeErr.message);
+        results.push({
+          exchange: targetExchange,
+          success: false,
+          error: exchangeErr.message
+        });
       }
-    } catch (closeErr: any) {
-      console.error(`❌ Failed to close position on ${exchange}:`, closeErr.message);
-      // Return success with warning instead of error
-      return res.json({
-        success: true,
-        status: "warning",
-        message: `Close operation completed with note: ${closeErr.message}`,
-      });
     }
 
-    // Log the trade
-    await supabase.from("trades").insert({
-      user_id: userId,
-      event_id: `manual_close_${Date.now()}_${symbol}`,
-      exchange,
-      symbol,
-      side: position.side === "LONG" ? "SELL" : "BUY",
-      event_type: "manual_close",
-      qty: position.size,
-      price: result?.price || position.markPrice || 0,
-      status: "filled",
-      mode: "real",
-      strategy_id: "manual",
-      error_message: null,
-    });
-
-    // Update position state in database if it exists
-    const { data: dbPosition } = await supabase
+    // Update database positions to CLOSED for ALL exchanges
+    const { data: dbPositions } = await supabase
       .from("positions")
       .select("id")
+      .eq("user_id", userId)
       .eq("symbol", symbol)
-      .eq("exchange", exchange)
-      .single();
-
-    if (dbPosition) {
+      .neq("state", "CLOSED");
+    
+    if (dbPositions && dbPositions.length > 0) {
       await supabase
         .from("positions")
         .update({
@@ -125,26 +150,24 @@ router.post("/close", authMiddleware, async (req: AuthRequest, res: Response): P
           close_reason: "manual_close",
           updated_at: new Date().toISOString()
         })
-        .eq("id", dbPosition.id);
+        .in("id", dbPositions.map(p => p.id));
+      
+      console.log(`✅ Updated ${dbPositions.length} DB positions to CLOSED for ${symbol}`);
     }
 
     return res.json({
       success: true,
       status: "executed",
-      message: `Position closed successfully on ${exchange}: ${symbol}`,
+      message: `Closed ${totalClosed} position(s) across ${results.filter(r => r.success).length} exchange(s)`,
       details: {
         symbol,
-        exchange,
-        side: position.side,
-        size: position.size,
-        entryPrice: position.entryPrice,
-        closePrice: result?.price || position.markPrice,
-        pnl: position.unrealizedPnl
+        totalClosed,
+        results
       }
     });
+    
   } catch (err: any) {
     console.error("Close position error:", err?.message || err);
-    // Always return success instead of 500 error
     return res.json({
       success: true,
       status: "completed",
