@@ -434,8 +434,28 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
         }
 
         if (!positionExists) {
-          // No position found - queue the exit signal
-          console.log(`⏳ No position for ${symbol}, queueing ${eventType} signal`);
+          // No position found - add a small delay and retry once (handles API latency after entry orders)
+          console.log(`⏳ No position for ${symbol}, waiting 5s before queueing...`);
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          
+          // Retry position check
+          let retryPositionExists = false;
+          for (const setup of allExchangeSetups) {
+            try {
+              const positions = await setup.client.getPositions();
+              if (positions.some((p) => p.symbol === symbol)) {
+                retryPositionExists = true;
+                console.log(`✅ Position found on ${setup.exchange} after retry!`);
+                break;
+              }
+            } catch (err: any) {
+              console.warn(`Failed to check positions on ${setup.exchange}: ${err.message}`);
+            }
+          }
+          
+          if (!retryPositionExists) {
+            // Still no position - queue the exit signal
+            console.log(`⏳ No position for ${symbol} after retry, queueing ${eventType} signal`);
           
           // Check if already queued
           const { data: existingQueue } = await supabase
@@ -504,7 +524,8 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
               queueUntil: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
             },
           });
-        }
+          } // End of if (!retryPositionExists)
+        } // End of if (!positionExists)
 
         // Position exists - proceed with close
         const errors: string[] = [];
@@ -558,6 +579,32 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
               undefined,
               positionSide
             );
+
+            // Update position state in database to CLOSED
+            const { data: dbPosition } = await supabase
+              .from("positions")
+              .select("id")
+              .eq("symbol", symbol)
+              .eq("exchange", setup.exchange)
+              .eq("user_id", userId)
+              .single();
+
+            if (dbPosition) {
+              await supabase
+                .from("positions")
+                .update({
+                  state: "CLOSED",
+                  close_reason: eventType === "tp1" || eventType === "tp2" || eventType === "tp3" || eventType === "tp4" || eventType === "tp5" || eventType === "tp" ? "take_profit" 
+                             : eventType === "sl" ? "stop_loss" 
+                             : "close_signal",
+                  updated_at: new Date().toISOString()
+                })
+                .eq("id", dbPosition.id);
+              
+              console.log(`💾 ${setup.exchange.toUpperCase()}: Updated position state to CLOSED for ${symbol}`);
+            } else {
+              console.warn(`⚠️ ${setup.exchange.toUpperCase()}: No matching position record found in DB for ${symbol}`);
+            }
           } catch (err: any) {
             errors.push(`${setup.exchange}: ${err.message}`);
             await logTrade(
@@ -700,8 +747,17 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
           const position = positions.find((p) => p.symbol === symbol);
 
           if (!position) {
-            // No position found - Queue the exit signal for later execution
-            console.log(`⏳ No position for ${symbol}, queueing ${eventType} signal`);
+            // No position found - add a small delay and retry once (handles API latency after entry orders)
+            console.log(`⏳ No position for ${symbol}, waiting 5s before queueing...`);
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            
+            // Retry position check
+            const retryPositions = await exchangeSetup.client.getPositions();
+            const retryPosition = retryPositions.find((p) => p.symbol === symbol);
+            
+            if (!retryPosition) {
+              // Still no position - Queue the exit signal for later execution
+              console.log(`⏳ No position for ${symbol} after retry, queueing ${eventType} signal`);
             
             // Check if already queued
             const { data: existingQueue } = await supabase
@@ -772,7 +828,8 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
                 queueUntil: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
               },
             });
-          }
+          } // End of if (!retryPosition)
+          } // End of if (!position)
 
           // SAFETY CHECK: Block TP/SL updates if position is still in PENDING_ENTRY state
           const { data: positionRecord } = await supabase
@@ -1085,8 +1142,17 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
           const position = positions.find((p) => p.symbol === symbol);
 
           if (!position) {
-            // No position found - Queue the SL signal for later execution
-            console.log(`⏳ No position for ${symbol}, queueing ${eventType} signal`);
+            // No position found - add a small delay and retry once (handles API latency after entry orders)
+            console.log(`⏳ No position for ${symbol}, waiting 5s before queueing...`);
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            
+            // Retry position check
+            const retryPositions = await exchangeSetup.client.getPositions();
+            const retryPosition = retryPositions.find((p) => p.symbol === symbol);
+            
+            if (!retryPosition) {
+              // Still no position - Queue the SL signal for later execution
+              console.log(`⏳ No position for ${symbol} after retry, queueing ${eventType} signal`);
             
             // Check if already queued
             const { data: existingQueue } = await supabase
@@ -1156,7 +1222,8 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
                 queueUntil: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
               },
             });
-          }
+          } // End of if (!retryPosition)
+          } // End of if (!position)
 
           // SAFETY CHECK: Block SL updates if position is still in PENDING_ENTRY state
           const { data: positionRecord } = await supabase
