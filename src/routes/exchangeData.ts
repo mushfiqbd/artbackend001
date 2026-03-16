@@ -106,9 +106,11 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
             // Skip positions that are marked as CLOSED in database
             // Database is source of truth - exchange API may be delayed
             if (dbPos.data.state === 'CLOSED') {
-              console.log(`⚠️ Skipping ${pos.symbol} - DB shows CLOSED state`);
+              console.log(`⚠️ Skipping ${pos.symbol} on ${exchange} - DB shows CLOSED state`);
               return null; // Filter out this position
             }
+            
+            console.log(`✅ Including ${pos.symbol} on ${exchange} - DB state: ${dbPos.data.state}`);
             
             // Get the actual position open time from trades table
             const entryTrade = await supabase
@@ -129,7 +131,7 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
               created_at: entryTrade?.data?.created_at || new Date().toISOString()
             };
             } else {
-            console.log(`⚠️ No DB match found for ${pos.symbol}`);
+            console.log(`⚠️ No DB match found for ${pos.symbol} on ${exchange}`);
             return pos;
             }
           } catch (err: any) {
