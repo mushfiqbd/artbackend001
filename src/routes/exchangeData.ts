@@ -101,7 +101,14 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
             }
             
           if (dbPos?.data) {
-            console.log(`✅ Found DB match: strategy_id="${dbPos.data.strategy_id}"`);
+            console.log(`✅ Found DB match: strategy_id="${dbPos.data.strategy_id}", state="${dbPos.data.state}"`);
+            
+            // Skip positions that are marked as CLOSED in database
+            // Database is source of truth - exchange API may be delayed
+            if (dbPos.data.state === 'CLOSED') {
+              console.log(`⚠️ Skipping ${pos.symbol} - DB shows CLOSED state`);
+              return null; // Filter out this position
+            }
             
             // Get the actual position open time from trades table
             const entryTrade = await supabase
@@ -130,7 +137,9 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
           return pos;
           }
         }));
-            openPositions.push(...enrichedPositions);
+            // Filter out null values (CLOSED positions) and add to openPositions
+            const validPositions = enrichedPositions.filter(p => p !== null);
+            openPositions.push(...validPositions);
           } else if (client instanceof BybitClient) {
            const positions = await client.getPositions();
            console.log(`🔍 Bybit: Found ${positions.length} position(s) from exchange API`);
@@ -198,7 +207,14 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
            }
            
         if (dbPos?.data) {
-         console.log(`✅ Found DB match: strategy_id="${dbPos.data.strategy_id}"`);
+         console.log(`✅ Found DB match: strategy_id="${dbPos.data.strategy_id}", state="${dbPos.data.state}"`);
+         
+         // Skip positions that are marked as CLOSED in database
+         // Database is source of truth - exchange API may be delayed
+         if (dbPos.data.state === 'CLOSED') {
+           console.log(`⚠️ Skipping ${pos.symbol} - DB shows CLOSED state`);
+           return null; // Filter out this position
+         }
          
          // Get the actual position open time from trades table
          const entryTrade = await supabase
@@ -227,7 +243,9 @@ router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promis
         return pos;
           }
         }));
-            openPositions.push(...enrichedPositions);
+            // Filter out null values (CLOSED positions) and add to openPositions
+            const validPositions = enrichedPositions.filter(p => p !== null);
+            openPositions.push(...validPositions);
           }
 
           // Fetch income/funding (Binance only for now)
