@@ -1685,24 +1685,57 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
             
             // Store strategy_id in positions table for display in Overview/Positions
             try {
-              await supabase.from("positions").upsert({
-                user_id: userId,
-                exchange: setup.exchange,
-                symbol,
-                side: side === "BUY" ? "LONG" : "SHORT",
-                size: exchangeQty,
-                entry_price: orderResult?.price || markPrice,
-                strategy_id: strategyId,
-                opened_by_webhook_id: eventId,
-                state: "OPEN",
-                opened_at: new Date().toISOString(),
-                leverage: clampedLeverage,
-              }, {
-                onConflict: 'user_id,exchange,symbol,side'
-              });
-              console.log(`💾 ${setup.exchange.toUpperCase()}: Stored strategy_id "${strategyId}" for ${symbol}`);
+              const positionSide = side === "BUY" ? "LONG" : "SHORT";
+              
+              // First, try to update existing position
+              const { data: existingPosition } = await supabase
+                .from("positions")
+                .select("id, state")
+                .eq("user_id", userId)
+                .eq("exchange", setup.exchange)
+                .eq("symbol", symbol)
+                .eq("side", positionSide)
+                .neq("state", "CLOSED")
+                .single();
+              
+              if (existingPosition) {
+                // Update existing position
+                await supabase
+                  .from("positions")
+                  .update({
+                    size: exchangeQty,
+                    entry_price: orderResult?.price || markPrice,
+                    strategy_id: strategyId,
+                    opened_by_webhook_id: eventId,
+                    state: "OPEN", // Ensure it's marked as OPEN
+                    opened_at: new Date().toISOString(),
+                    leverage: clampedLeverage,
+                    updated_at: new Date().toISOString()
+                  })
+                  .eq("id", existingPosition.id);
+                
+                console.log(`💾 ${setup.exchange.toUpperCase()}: Updated existing position for ${symbol}`);
+              } else {
+                // Create new position record
+                await supabase.from("positions").insert({
+                  user_id: userId,
+                  exchange: setup.exchange.toUpperCase(),
+                  symbol,
+                  side: positionSide,
+                  size: exchangeQty,
+                  entry_price: orderResult?.price || markPrice,
+                  strategy_id: strategyId,
+                  opened_by_webhook_id: eventId,
+                  state: "OPEN",
+                  opened_at: new Date().toISOString(),
+                  leverage: clampedLeverage,
+                  created_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString()
+                });
+                console.log(`💾 ${setup.exchange.toUpperCase()}: Created new position record for ${symbol}`);
+              }
             } catch (dbErr: any) {
-              console.warn(`⚠️ Failed to store strategy_id in positions: ${dbErr.message}`);
+              console.warn(`⚠️ Failed to store position in database: ${dbErr.message}`);
               // Don't fail the trade - just log warning
             }
           } catch (orderErr: any) {
