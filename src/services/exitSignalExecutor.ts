@@ -127,6 +127,35 @@ export async function executeQueuedExitSignals() {
             })
             .eq("id", signal.id);
 
+          // Update database position state to CLOSED
+          try {
+            const { data: dbPosition } = await supabase
+              .from("positions")
+              .select("id")
+              .eq("user_id", signal.user_id)
+              .eq("symbol", signal.symbol)
+              .eq("exchange", positionFoundOnExchange)
+              .neq("state", "CLOSED")
+              .single();
+            
+            if (dbPosition) {
+              await supabase
+                .from("positions")
+                .update({
+                  state: "CLOSED",
+                  close_reason: signal.event_type.includes("tp") ? "take_profit" 
+                             : signal.event_type.includes("sl") ? "stop_loss" 
+                             : "close_signal",
+                  updated_at: new Date().toISOString()
+                })
+                .eq("id", dbPosition.id);
+              
+              console.log(`💾 ${positionFoundOnExchange.toUpperCase()}: Updated position state to CLOSED for ${signal.symbol}`);
+            }
+          } catch (dbErr: any) {
+            console.warn(`⚠️ Failed to update position state in database: ${dbErr.message}`);
+          }
+
           // Log the successful execution
           await supabase.from("trades").insert({
             user_id: signal.user_id,
