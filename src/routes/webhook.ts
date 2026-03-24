@@ -1588,6 +1588,42 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
     const clampedLeverage = Math.min(125, Math.max(1, leverage));
     const side = resolveSide(eventType, payload);
 
+    // ===== SINGLE POSITION LIMIT CHECK =====
+const maxPositions = 1; // Your requirement
+
+console.log(`🔒 Checking position limit (max ${maxPositions})...`);
+
+const { data: openPositions } = await supabase
+  .from("positions")
+  .select("id, symbol, exchange, side, size")
+  .eq("user_id", userId)
+  .neq("state", "CLOSED");
+
+if (openPositions && openPositions.length >= maxPositions) {
+  console.log(`⛔ Position limit reached: ${openPositions.length}/${maxPositions}`);
+  
+  await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, markPrice, 
+    "rejected", activeMode, strategyId, `Position limit reached`);
+  await updateWebhookStatus(eventId, userId, "failed");
+  
+  return res.json({
+    success: false,
+    status: "position_limit_reached",
+    message: `Cannot open - already have ${openPositions.length} position(s)`,
+    details: {
+      openPositionsCount: openPositions.length,
+      maxAllowed: maxPositions,
+      openPositions: openPositions.map((p: any) => ({
+        symbol: p.symbol,
+        side: p.side,
+        size: p.size,
+        exchange: p.exchange
+      }))
+    },
+  });
+}
+// ===== END SINGLE POSITION LIMIT CHECK =====
+
     // 11. Execute or log
     if (activeMode === "real" && allExchangeSetups.length > 0) {
       try {
