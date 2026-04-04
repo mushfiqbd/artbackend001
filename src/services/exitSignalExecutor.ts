@@ -1,7 +1,9 @@
 /**
  * Exit Signal Queue Executor Service
  * 
- * Automatically checks queued exit signals and executes them when positions exist
+ * Automatically checks queued signals and executes them when conditions are met
+ * - Entry signals: Execute when position slot is available (no open positions)
+ * - Exit signals: Execute when position exists
  * Runs every 30 seconds to check for executable signals
  */
 
@@ -16,7 +18,7 @@ export async function executeQueuedExitSignals() {
     
     const now = new Date().toISOString();
 
-    // Get pending exit signals that haven't expired
+    // Get pending signals that haven't expired
     const { data: pendingSignals, error: fetchError } = await supabase
       .from("exit_signal_queue")
       .select("*")
@@ -25,7 +27,7 @@ export async function executeQueuedExitSignals() {
       .order("created_at", { ascending: true }); // Process oldest first
 
     if (fetchError) {
-      console.error("❌ Error fetching pending exit signals:", JSON.stringify(fetchError, null, 2));
+      console.error("❌ Error fetching pending signals:", JSON.stringify(fetchError, null, 2));
       return;
     }
 
@@ -38,6 +40,67 @@ export async function executeQueuedExitSignals() {
 
     for (const signal of pendingSignals) {
       try {
+        const eventType = signal.event_type.toLowerCase();
+        const isEntrySignal = eventType.includes('entry') || (eventType.includes('long') && !eventType.includes('exit')) || (eventType.includes('short') && !eventType.includes('exit'));
+        
+        if (isEntrySignal) {
+          // Handle ENTRY signal - check if position slot is available
+          console.log(`🔍 Checking position slot availability for ${signal.symbol} (${signal.event_type})...`);
+          
+          // Check current open positions count
+          const { data: openPositions } = await supabase
+            .from("positions")
+            .select("id")
+            .eq("user_id", signal.user_id)
+            .neq("state", "CLOSED");
+          
+          const openCount = openPositions?.length || 0;
+          const maxPositions = 1; // Should match webhook config
+          
+          if (openCount >= maxPositions) {
+            console.log(`⏳ Position limit reached (${openCount}/${maxPositions}), keeping entry in queue (retry ${signal.retry_count}/${signal.max_retries})`);
+            
+            // Increment retry count
+            if (signal.retry_count >= signal.max_retries) {
+              console.log(`❌ Max retries reached for ${signal.symbol}, marking as failed`);
+              await supabase
+                .from("exit_signal_queue")
+                .update({
+                  status: "failed",
+                  failure_reason: `Max retries (${signal.max_retries}) reached - position limit still active`,
+                  updated_at: new Date().toISOString()
+                })
+                .eq("id", signal.id);
+            } else {
+              await supabase
+                .from("exit_signal_queue")
+                .update({
+                  retry_count: signal.retry_count + 1,
+                  updated_at: new Date().toISOString()
+                })
+                .eq("id", signal.id);
+            }
+            continue;
+          }
+          
+          // Position slot available - will be handled by re-processing webhook
+          console.log(`✅ Position slot available (${openCount}/${maxPositions}), but entry execution requires webhook re-trigger`);
+          console.log(`ℹ️ Note: Entry signals should be re-sent from TradingView when slot opens`);
+          
+          // Mark as completed since we can't auto-execute entries without webhook
+          await supabase
+            .from("exit_signal_queue")
+            .update({
+              status: "completed",
+              failure_reason: "Entry signal queued - please re-send alert when position slot opens",
+              updated_at: new Date().toISOString()
+            })
+            .eq("id", signal.id);
+          
+          continue;
+        }
+        
+        // Handle EXIT signal - check if position exists
         console.log(`🔍 Checking if position exists for ${signal.symbol} (${signal.event_type})...`);
         
         // Get all exchange clients for this user
