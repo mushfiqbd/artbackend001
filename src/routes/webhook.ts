@@ -1588,41 +1588,106 @@ router.post("/", async (req: Request, res: Response): Promise<Response | void> =
     const clampedLeverage = Math.min(125, Math.max(1, leverage));
     const side = resolveSide(eventType, payload);
 
-    // ===== SINGLE POSITION LIMIT CHECK =====
-const maxPositions = 1; // Your requirement
+    // ===== SINGLE POSITION LIMIT CHECK WITH AUTO-QUEUE =====
+    const maxPositions = 1; // Your requirement
 
-console.log(`🔒 Checking position limit (max ${maxPositions})...`);
+    console.log(`🔒 Checking position limit (max ${maxPositions})...`);
 
-const { data: openPositions } = await supabase
-  .from("positions")
-  .select("id, symbol, exchange, side, size")
-  .eq("user_id", userId)
-  .neq("state", "CLOSED");
+    const { data: openPositions } = await supabase
+      .from("positions")
+      .select("id, symbol, exchange, side, size")
+      .eq("user_id", userId)
+      .neq("state", "CLOSED");
 
-if (openPositions && openPositions.length >= maxPositions) {
-  console.log(`⛔ Position limit reached: ${openPositions.length}/${maxPositions}`);
-  
-  await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, markPrice, 
-    "rejected", activeMode, strategyId, `Position limit reached`);
-  await updateWebhookStatus(eventId, userId, "failed");
-  
-  return res.json({
-    success: false,
-    status: "position_limit_reached",
-    message: `Cannot open - already have ${openPositions.length} position(s)`,
-    details: {
-      openPositionsCount: openPositions.length,
-      maxAllowed: maxPositions,
-      openPositions: openPositions.map((p: any) => ({
-        symbol: p.symbol,
-        side: p.side,
-        size: p.size,
-        exchange: p.exchange
-      }))
-    },
-  });
-}
-// ===== END SINGLE POSITION LIMIT CHECK =====
+    if (openPositions && openPositions.length >= maxPositions) {
+      console.log(`⛔ Position limit reached: ${openPositions.length}/${maxPositions}`);
+      console.log(`⏳ Auto-queuing entry signal for later execution...`);
+      
+      // Check if already queued
+      const { data: existingQueue } = await supabase
+        .from("exit_signal_queue")
+        .select("id")
+        .eq("user_id", userId)
+        .eq("event_id", eventId)
+        .single();
+
+      if (existingQueue) {
+        console.log(`ℹ️ Entry signal already queued: ${eventId}`);
+        await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, markPrice, 
+          "queued", activeMode, strategyId, `Already queued - waiting for position slot`);
+        await updateWebhookStatus(eventId, userId, "processed");
+        
+        return res.json({
+          success: true,
+          status: "queued",
+          message: `Entry signal queued for ${symbol}. Will execute when position slot opens.`,
+          details: {
+            openPositionsCount: openPositions.length,
+            maxAllowed: maxPositions,
+            currentPositions: openPositions.map((p: any) => ({
+              symbol: p.symbol,
+              side: p.side,
+              size: p.size,
+              exchange: p.exchange
+            }))
+          },
+        });
+      }
+
+      // Add to queue for auto-execution when position closes
+      const { error: queueError } = await supabase
+        .from("exit_signal_queue")
+        .insert({
+          user_id: userId,
+          event_id: eventId,
+          event_type: eventType,
+          symbol,
+          exchange: wantsBoth ? "both" : rawExchange,
+          side: side === "BUY" ? "LONG" : "SHORT",
+          payload: req.body,
+          tp_price: extractTPPrice(req.body),
+          sl_price: extractSLPrice(req.body),
+          partial_percent: extractPartialPercentage(req.body),
+          status: "pending",
+          retry_count: 0,
+          max_retries: 20, // More retries for entry signals
+          created_at: new Date().toISOString(),
+          expires_at: new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(), // 72 hours
+        });
+
+      if (queueError) {
+        console.error("❌ Failed to queue entry signal:", queueError.message);
+        await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, markPrice, 
+          "failed", activeMode, strategyId, `Failed to queue: ${queueError.message}`);
+        await updateWebhookStatus(eventId, userId, "failed");
+        
+        return res.status(500).json({
+          success: false,
+          status: "queue_error",
+          message: "Failed to queue entry signal",
+        });
+      }
+
+      console.log(`✅ Queued entry signal for ${symbol} on ${wantsBoth ? "both" : rawExchange}`);
+      await logTrade(userId, eventId, exchangeName, symbol, eventType, 0, markPrice, 
+        "queued", activeMode, strategyId, `Queued - waiting for position slot (limit: ${maxPositions})`);
+      await updateWebhookStatus(eventId, userId, "processed");
+
+      return res.json({
+        success: true,
+        status: "queued",
+        message: `Entry signal queued for ${symbol}. Will auto-execute when a position slot opens.`,
+        details: { 
+          symbol, 
+          eventType, 
+          side: side === "BUY" ? "LONG" : "SHORT",
+          openPositionsCount: openPositions.length,
+          maxAllowed: maxPositions,
+          queueUntil: new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString()
+        },
+      });
+    }
+    // ===== END SINGLE POSITION LIMIT CHECK WITH AUTO-QUEUE =====
 
     // 11. Execute or log
     if (activeMode === "real" && allExchangeSetups.length > 0) {
